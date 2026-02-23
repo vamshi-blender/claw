@@ -18,11 +18,11 @@ async function loadSettings() {
   const settings = result.llmSettings as LlmSettings | undefined;
 
   if (!settings) {
-    modelInput.value = "gpt-4.1-mini";
+    modelInput.value = "gpt-4.1-mini-2025-04-14";
     return;
   }
 
-  modelInput.value = settings.model || "gpt-4.1-mini";
+  modelInput.value = settings.model || "gpt-4.1-mini-2025-04-14";
   apiKeyInput.value = settings.apiKey || "";
 }
 

@@ -60,6 +60,8 @@ Replace the mock tool implementation in `src/background/graph.ts` with real acti
   - Expected: OpenAI chatbot response
 - Input: `/cdp click #login-button`
   - Expected: mock tool route and tool result text
+- Input: `/runjs document.title`
+  - Expected: executes on active tab and returns script result
 - Reuse the same thread id to observe accumulated memory state in the panel.
 
 ## Folder structure

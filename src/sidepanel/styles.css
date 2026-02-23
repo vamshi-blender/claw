@@ -41,6 +41,18 @@ label {
   font-weight: 600;
 }
 
+.thread-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+#newThreadBtn {
+  padding: 8px 12px;
+  min-width: 40px;
+}
+
 input,
 textarea,
 select,

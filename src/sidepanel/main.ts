@@ -3,7 +3,10 @@ type GraphResponse = {
   response?: string;
   state?: {
     turn: number;
-    messages: string[];
+    messages: Array<{
+      role: "user" | "assistant" | "tool";
+      content: string;
+    }>;
     lastToolResult: string | null;
   };
   error?: string;
@@ -13,10 +16,11 @@ const threadInput = document.querySelector<HTMLInputElement>("#threadId");
 const promptInput = document.querySelector<HTMLTextAreaElement>("#prompt");
 const runButton = document.querySelector<HTMLButtonElement>("#runBtn");
 const optionsButton = document.querySelector<HTMLButtonElement>("#optionsBtn");
+const newThreadButton = document.querySelector<HTMLButtonElement>("#newThreadBtn");
 const latestOutput = document.querySelector<HTMLPreElement>("#latest");
 const memoryOutput = document.querySelector<HTMLPreElement>("#memory");
 
-if (!threadInput || !promptInput || !runButton || !optionsButton || !latestOutput || !memoryOutput) {
+if (!threadInput || !promptInput || !runButton || !optionsButton || !newThreadButton || !latestOutput || !memoryOutput) {
   throw new Error("Side panel UI is missing required elements.");
 }
 
@@ -52,4 +56,10 @@ runButton.addEventListener("click", () => {
 
 optionsButton.addEventListener("click", () => {
   void chrome.runtime.openOptionsPage();
+});
+
+newThreadButton.addEventListener("click", () => {
+  threadInput.value = crypto.randomUUID();
+  latestOutput.textContent = "";
+  memoryOutput.textContent = "";
 });

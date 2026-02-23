@@ -9,11 +9,14 @@
   <body>
     <main class="panel">
       <h1>LangGraph Orchestrator</h1>
-      <p class="sub">Use <code>/cdp click #selector</code> to trigger the mock CDP tool.</p>
+      <p class="sub">Ask naturally (for example: run JS to get page title) or use <code>/runjs ...</code> / <code>/cdp ...</code>.</p>
 
       <label>
         Thread ID
-        <input id="threadId" type="text" value="default-thread" />
+        <div class="thread-row">
+          <input id="threadId" type="text" value="default-thread" />
+          <button id="newThreadBtn" type="button" title="Generate new thread ID">+</button>
+        </div>
       </label>
 
       <label>
