@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LangGraph CDP Orchestrator</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <h1>LangGraph Orchestrator</h1>
+      <p class="sub">Use <code>/cdp click #selector</code> to trigger the mock CDP tool.</p>
+
+      <label>
+        Thread ID
+        <input id="threadId" type="text" value="default-thread" />
+      </label>
+
+      <label>
+        Input
+        <textarea id="prompt" rows="4" placeholder="Ask a question or try: /cdp click #login-button"></textarea>
+      </label>
+
+      <button id="runBtn" type="button">Send</button>
+      <button id="optionsBtn" type="button">Open Options</button>
+
+      <section>
+        <h2>Latest Result</h2>
+        <pre id="latest"></pre>
+      </section>
+
+      <section>
+        <h2>Thread Memory</h2>
+        <pre id="memory"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

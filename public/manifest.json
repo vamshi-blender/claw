@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "LangGraph CDP Orchestrator (Minimal)",
+  "description": "Minimal Chrome extension that runs a LangGraph workflow in the background service worker.",
+  "version": "0.1.0",
+  "permissions": ["storage", "sidePanel", "tabs"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open LangGraph panel"
+  },
+  "options_page": "options.html",
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}

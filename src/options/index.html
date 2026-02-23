@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Extension Options</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <h1>Chat Model Settings</h1>
+      <p class="sub">Choose an OpenAI model and save your API key for this extension.</p>
+
+      <label>
+        Provider
+        <input id="provider" type="text" value="openai" disabled />
+      </label>
+
+      <label>
+        Model
+        <input id="model" type="text" value="gpt-4.1-mini" placeholder="e.g. gpt-4.1-mini" />
+      </label>
+
+      <label>
+        OpenAI API Key
+        <input id="apiKey" type="password" placeholder="sk-..." />
+      </label>
+
+      <button id="saveBtn" type="button">Save Settings</button>
+      <pre id="status"></pre>
+    </main>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

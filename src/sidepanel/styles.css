@@ -1,0 +1,80 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", "SF Pro Text", "Helvetica Neue", sans-serif;
+  --bg: #f4f6fb;
+  --panel: #ffffff;
+  --ink: #16213f;
+  --ink-muted: #4f5f88;
+  --accent: #0d7a66;
+  --border: #d3dbef;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(circle at top, #dce9ff 0%, var(--bg) 40%);
+  color: var(--ink);
+}
+
+.panel {
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+h1,
+h2 {
+  margin: 0;
+}
+
+.sub {
+  margin: 0;
+  color: var(--ink-muted);
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  font-weight: 600;
+}
+
+input,
+textarea,
+select,
+button {
+  font: inherit;
+}
+
+input,
+textarea,
+select {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: var(--panel);
+}
+
+button {
+  border: none;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: var(--accent);
+  color: white;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+pre {
+  margin: 0;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow: auto;
+}
