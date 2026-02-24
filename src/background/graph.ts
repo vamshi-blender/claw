@@ -177,6 +177,56 @@ const tabsContextTool = tool(
   }
 );
 
+const tabsCreateTool = tool(
+  async () => {
+    const contextTab = await getCurrentContextTab();
+    if (!contextTab?.windowId) {
+      return JSON.stringify({
+        success: false,
+        action: "tabs_create",
+        error: "No active tab/window found for current context.",
+      });
+    }
+
+    try {
+      const created = await chrome.tabs.create({
+        windowId: contextTab.windowId,
+        active: true,
+      });
+
+      if (typeof contextTab.groupId === "number" && contextTab.groupId >= 0 && created.id) {
+        await chrome.tabs.group({
+          tabIds: [created.id],
+          groupId: contextTab.groupId,
+        });
+      }
+
+      return JSON.stringify({
+        success: true,
+        action: "tabs_create",
+        initialTabId: contextTab.id ?? null,
+        createdTab: {
+          tabId: created.id ?? null,
+          title: created.title ?? "",
+          url: created.url ?? "",
+        },
+      });
+    } catch (error) {
+      return JSON.stringify({
+        success: false,
+        action: "tabs_create",
+        error: String(error),
+      });
+    }
+  },
+  {
+    name: "tabs_create",
+    description:
+      "Create a new empty tab in the current tab group. This tool takes no parameters.",
+    schema: z.object({}),
+  }
+);
+
 const navigateTool = tool(
   async ({ url, tabId }) => {
     const scope = await validateTabInCurrentScope(tabId);
@@ -342,7 +392,7 @@ const javascriptTool = tool(
   }
 );
 
-const tools = [tabsContextTool, navigateTool, javascriptTool, turnAnswerStartTool];
+const tools = [tabsContextTool, tabsCreateTool, navigateTool, javascriptTool, turnAnswerStartTool];
 const toolNode = new ToolNode(tools);
 const checkpointer = new MemorySaver();
 let fallbackSettings: LlmSettings | undefined;
@@ -397,6 +447,13 @@ function parseDirectCommand(input: string): ToolCall | null {
   if (trimmed === "/tabs_context" || trimmed === "/tabs") {
     return {
       name: tabsContextTool.name,
+      args: {},
+    };
+  }
+
+  if (trimmed === "/tabs_create" || trimmed === "/newtab") {
+    return {
+      name: tabsCreateTool.name,
       args: {},
     };
   }
@@ -490,6 +547,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
     new SystemMessage(
         "You are a Chrome extension assistant. Use tool calling when actions are needed. " +
         "Call tabs_context first when you need a valid tabId or when the user asks about available tabs. " +
+        "Call tabs_create to create a new tab in the current tab group/context. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call javascript_tool with action='javascript_exec', text, and tabId when user asks to run JavaScript on a page. " +
         "Call turn_answer_start immediately before your final user-facing response in every turn. " +
