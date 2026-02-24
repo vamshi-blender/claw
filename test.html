@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>UI Action Test Page</title>
+<style>
+  body {
+    font-family: sans-serif;
+    margin: 30px;
+  }
+  section {
+    margin-bottom: 40px;
+    border: 1px solid #ccc;
+    padding: 15px;
+  }
+  .hover-box {
+    width: 150px;
+    height: 100px;
+    background: #eef;
+    line-height: 100px;
+    text-align: center;
+    transition: background 0.3s;
+  }
+  .hover-box:hover {
+    background: #cfc;
+  }
+  .drag-area {
+    width: 200px;
+    height: 100px;
+    background: #fdd;
+    position: relative;
+  }
+  .draggable {
+    width: 50px;
+    height: 50px;
+    background: #d77;
+    position: absolute;
+    top: 25px;
+    left: 25px;
+    cursor: grab;
+  }
+  .spacer {
+    height: 800px; /* for scroll testing */
+  }
+</style>
+</head>
+<body>
+
+<h1>Interaction Test Page</h1>
+
+<section id="click-tests">
+  <h2>Click Tests</h2>
+  <button id="leftClickBtn">Left Click Me</button>
+  <button id="rightClickBtn">Right Click Me</button>
+  <button id="doubleClickBtn">Double Click Me</button>
+  <button id="tripleClickBtn">Triple Click Me</button>
+  <p id="clickOutput">Action: (none)</p>
+</section>
+
+<section id="typing-tests">
+  <h2>Typing Test</h2>
+  <input type="text" id="textInput" placeholder="Type here..." />
+  <p id="typedOutput"></p>
+</section>
+
+<section id="hover-tests">
+  <h2>Hover Test</h2>
+  <div class="hover-box" id="hoverBox">Hover over me</div>
+</section>
+
+<section id="drag-tests">
+  <h2>Drag Test</h2>
+  <div class="drag-area" id="dragArea">
+    <div class="draggable" id="draggable"></div>
+  </div>
+</section>
+
+<section id="scroll-tests">
+  <h2>Scroll Test</h2>
+  <div class="spacer"></div>
+  <p>You scrolled all the way down. 🎯</p>
+</section>
+
+<script>
+  // Click tests
+  const output = document.getElementById('clickOutput');
+  document.getElementById('leftClickBtn').addEventListener('click', () => output.textContent = 'Action: Left click');
+  document.getElementById('rightClickBtn').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    output.textContent = 'Action: Right click';
+  });
+  document.getElementById('doubleClickBtn').addEventListener('dblclick', () => output.textContent = 'Action: Double click');
+
+  // Triple click detection (quick 3 left clicks)
+  const tripleBtn = document.getElementById('tripleClickBtn');
+  let clickCount = 0;
+  let clickTimer;
+  tripleBtn.addEventListener('click', () => {
+    clickCount++;
+    clearTimeout(clickTimer);
+    clickTimer = setTimeout(() => clickCount = 0, 400);
+    if (clickCount === 3) {
+      output.textContent = 'Action: Triple click';
+      clickCount = 0;
+    }
+  });
+
+  // Typing test
+  const input = document.getElementById('textInput');
+  const typedOutput = document.getElementById('typedOutput');
+  input.addEventListener('input', () => typedOutput.textContent = 'You typed: ' + input.value);
+
+  // Drag-and-drop
+  const draggable = document.getElementById('draggable');
+  const area = document.getElementById('dragArea');
+  let isDragging = false;
+  draggable.addEventListener('mousedown', e => { isDragging = true; });
+  window.addEventListener('mouseup', e => { isDragging = false; });
+  window.addEventListener('mousemove', e => {
+    if (!isDragging) return;
+    const rect = area.getBoundingClientRect();
+    const x = e.clientX - rect.left - draggable.clientWidth / 2;
+    const y = e.clientY - rect.top - draggable.clientHeight / 2;
+    draggable.style.left = Math.max(0, Math.min(rect.width - draggable.clientWidth, x)) + 'px';
+    draggable.style.top = Math.max(0, Math.min(rect.height - draggable.clientHeight, y)) + 'px';
+  });
+
+  // Hover visual feedback (already CSS)
+  document.getElementById('hoverBox').addEventListener('mouseenter', () => console.log('Hover started'));
+  document.getElementById('hoverBox').addEventListener('mouseleave', () => console.log('Hover ended'));
+</script>
+
+</body>
+</html>

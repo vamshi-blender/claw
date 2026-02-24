@@ -142,6 +142,890 @@ function classifyDeviceType(width: number) {
   return "desktop";
 }
 
+const COMPUTER_ACTIONS = [
+  "left_click",
+  "right_click",
+  "double_click",
+  "triple_click",
+  "type",
+  "screenshot",
+  "wait",
+  "scroll",
+  "key",
+  "left_click_drag",
+  "zoom",
+  "scroll_to",
+  "hover",
+] as const;
+
+type ComputerAction = (typeof COMPUTER_ACTIONS)[number];
+type ModifierName = "alt" | "ctrl" | "meta" | "shift";
+
+type ElementSummary = {
+  ref: string;
+  type: string;
+  name?: string;
+  visible: boolean;
+};
+
+type StoredScreenshot = {
+  id: string;
+  tabId: number;
+  kind: "screenshot" | "zoom";
+  dataUrl: string;
+  width: number;
+  height: number;
+  createdAt: string;
+  region?: [number, number, number, number];
+};
+
+type TabLockState = {
+  busy: boolean;
+  waiters: Array<() => void>;
+};
+
+const tabActionLocks = new Map<number, TabLockState>();
+const screenshotStore = new Map<string, StoredScreenshot>();
+const MAX_STORED_SCREENSHOTS = 30;
+let screenshotCounter = 0;
+
+const MODIFIER_BITS: Record<ModifierName, number> = {
+  alt: 1,
+  ctrl: 2,
+  meta: 4,
+  shift: 8,
+};
+
+const MODIFIER_ORDER: ModifierName[] = ["ctrl", "shift", "alt", "meta"];
+
+type KeyDefinition = {
+  key: string;
+  code: string;
+  keyCode: number;
+  text?: string;
+};
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function withTabActionLock<T>(tabId: number, action: () => Promise<T>): Promise<T> {
+  let lock = tabActionLocks.get(tabId);
+  if (!lock) {
+    lock = { busy: false, waiters: [] };
+    tabActionLocks.set(tabId, lock);
+  }
+
+  if (lock.busy) {
+    await new Promise<void>((resolve) => {
+      lock!.waiters.push(resolve);
+    });
+  }
+
+  lock.busy = true;
+  try {
+    return await action();
+  } finally {
+    const next = lock.waiters.shift();
+    if (next) {
+      next();
+    } else {
+      lock.busy = false;
+      tabActionLocks.delete(tabId);
+    }
+  }
+}
+
+async function withDebuggerSession<T>(
+  tabId: number,
+  action: (debuggee: chrome.debugger.Debuggee) => Promise<T>
+): Promise<T> {
+  const debuggee: chrome.debugger.Debuggee = { tabId };
+  await chrome.debugger.attach(debuggee, "1.3");
+  try {
+    return await action(debuggee);
+  } finally {
+    try {
+      await chrome.debugger.detach(debuggee);
+    } catch {
+      // Ignore detach errors.
+    }
+  }
+}
+
+function parseModifierString(raw: string | undefined) {
+  if (!raw || !raw.trim()) {
+    return { ok: true as const, bitmask: 0, normalized: undefined as string | undefined };
+  }
+
+  const aliases: Record<string, ModifierName> = {
+    ctrl: "ctrl",
+    control: "ctrl",
+    shift: "shift",
+    alt: "alt",
+    cmd: "meta",
+    command: "meta",
+    meta: "meta",
+    win: "meta",
+    windows: "meta",
+  };
+
+  const tokens = raw
+    .split("+")
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean);
+
+  const deduped = new Set<ModifierName>();
+  for (const token of tokens) {
+    const normalized = aliases[token];
+    if (!normalized) {
+      return {
+        ok: false as const,
+        error:
+          `Invalid modifier '${token}'. Supported modifiers: ctrl, shift, alt, cmd/meta, win/windows.`,
+      };
+    }
+    deduped.add(normalized);
+  }
+
+  let bitmask = 0;
+  const ordered = MODIFIER_ORDER.filter((name) => deduped.has(name));
+  for (const name of ordered) {
+    bitmask |= MODIFIER_BITS[name];
+  }
+
+  return {
+    ok: true as const,
+    bitmask,
+    normalized: ordered.length > 0 ? ordered.join("+") : undefined,
+  };
+}
+
+function normalizePoint(point: [number, number]): [number, number] {
+  return [Math.round(point[0]), Math.round(point[1])];
+}
+
+function normalizeRegion(region: [number, number, number, number]) {
+  const [x0, y0, x1, y1] = region;
+  const left = Math.min(x0, x1);
+  const right = Math.max(x0, x1);
+  const top = Math.min(y0, y1);
+  const bottom = Math.max(y0, y1);
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+function nextScreenshotId() {
+  screenshotCounter += 1;
+  return `screenshot_${String(screenshotCounter).padStart(6, "0")}`;
+}
+
+function storeScreenshot(
+  tabId: number,
+  kind: "screenshot" | "zoom",
+  dataUrl: string,
+  width: number,
+  height: number,
+  region?: [number, number, number, number]
+) {
+  const id = nextScreenshotId();
+  screenshotStore.set(id, {
+    id,
+    tabId,
+    kind,
+    dataUrl,
+    width,
+    height,
+    createdAt: new Date().toISOString(),
+    ...(region ? { region } : {}),
+  });
+
+  while (screenshotStore.size > MAX_STORED_SCREENSHOTS) {
+    const oldest = screenshotStore.keys().next();
+    if (oldest.done) {
+      break;
+    }
+    screenshotStore.delete(oldest.value);
+  }
+
+  return id;
+}
+
+function keyDefinitionFromName(input: string): KeyDefinition | null {
+  const raw = input.trim();
+  if (!raw) {
+    return null;
+  }
+
+  const lowered = raw.toLowerCase();
+  const specials: Record<string, KeyDefinition> = {
+    enter: { key: "Enter", code: "Enter", keyCode: 13 },
+    tab: { key: "Tab", code: "Tab", keyCode: 9 },
+    backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+    delete: { key: "Delete", code: "Delete", keyCode: 46 },
+    del: { key: "Delete", code: "Delete", keyCode: 46 },
+    escape: { key: "Escape", code: "Escape", keyCode: 27 },
+    esc: { key: "Escape", code: "Escape", keyCode: 27 },
+    space: { key: " ", code: "Space", keyCode: 32, text: " " },
+    spacebar: { key: " ", code: "Space", keyCode: 32, text: " " },
+    arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+    arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+    arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+    arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+    home: { key: "Home", code: "Home", keyCode: 36 },
+    end: { key: "End", code: "End", keyCode: 35 },
+    pageup: { key: "PageUp", code: "PageUp", keyCode: 33 },
+    pagedown: { key: "PageDown", code: "PageDown", keyCode: 34 },
+    insert: { key: "Insert", code: "Insert", keyCode: 45 },
+    control: { key: "Control", code: "ControlLeft", keyCode: 17 },
+    ctrl: { key: "Control", code: "ControlLeft", keyCode: 17 },
+    shift: { key: "Shift", code: "ShiftLeft", keyCode: 16 },
+    alt: { key: "Alt", code: "AltLeft", keyCode: 18 },
+    meta: { key: "Meta", code: "MetaLeft", keyCode: 91 },
+    cmd: { key: "Meta", code: "MetaLeft", keyCode: 91 },
+    windows: { key: "Meta", code: "MetaLeft", keyCode: 91 },
+    win: { key: "Meta", code: "MetaLeft", keyCode: 91 },
+  };
+
+  if (specials[lowered]) {
+    return specials[lowered];
+  }
+
+  const functionMatch = lowered.match(/^f([1-9]|1[0-2])$/);
+  if (functionMatch) {
+    const number = Number.parseInt(functionMatch[1], 10);
+    return {
+      key: `F${number}`,
+      code: `F${number}`,
+      keyCode: 111 + number,
+    };
+  }
+
+  if (/^[a-z]$/i.test(raw)) {
+    const upper = raw.toUpperCase();
+    return {
+      key: raw.length === 1 ? raw : upper,
+      code: `Key${upper}`,
+      keyCode: upper.charCodeAt(0),
+      text: raw.length === 1 ? raw : undefined,
+    };
+  }
+
+  if (/^\d$/.test(raw)) {
+    return {
+      key: raw,
+      code: `Digit${raw}`,
+      keyCode: raw.charCodeAt(0),
+      text: raw,
+    };
+  }
+
+  const punctuation: Record<string, KeyDefinition> = {
+    ".": { key: ".", code: "Period", keyCode: 190, text: "." },
+    ",": { key: ",", code: "Comma", keyCode: 188, text: "," },
+    "/": { key: "/", code: "Slash", keyCode: 191, text: "/" },
+    "\\": { key: "\\", code: "Backslash", keyCode: 220, text: "\\" },
+    "-": { key: "-", code: "Minus", keyCode: 189, text: "-" },
+    "=": { key: "=", code: "Equal", keyCode: 187, text: "=" },
+    ";": { key: ";", code: "Semicolon", keyCode: 186, text: ";" },
+    "'": { key: "'", code: "Quote", keyCode: 222, text: "'" },
+    "[": { key: "[", code: "BracketLeft", keyCode: 219, text: "[" },
+    "]": { key: "]", code: "BracketRight", keyCode: 221, text: "]" },
+    "`": { key: "`", code: "Backquote", keyCode: 192, text: "`" },
+  };
+  if (punctuation[raw]) {
+    return punctuation[raw];
+  }
+
+  return null;
+}
+
+async function dispatchClick(
+  debuggee: chrome.debugger.Debuggee,
+  coordinate: [number, number],
+  button: "left" | "right",
+  clickCount: number,
+  modifiersBitmask: number
+) {
+  await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: coordinate[0],
+    y: coordinate[1],
+    modifiers: modifiersBitmask,
+  });
+
+  const buttonMask = button === "left" ? 1 : 2;
+  for (let i = 1; i <= clickCount; i += 1) {
+    await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: coordinate[0],
+      y: coordinate[1],
+      button,
+      buttons: buttonMask,
+      clickCount: i,
+      modifiers: modifiersBitmask,
+    });
+    await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: coordinate[0],
+      y: coordinate[1],
+      button,
+      buttons: 0,
+      clickCount: i,
+      modifiers: modifiersBitmask,
+    });
+  }
+}
+
+async function dispatchDrag(
+  debuggee: chrome.debugger.Debuggee,
+  start: [number, number],
+  end: [number, number],
+  modifiersBitmask: number
+) {
+  await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: start[0],
+    y: start[1],
+    modifiers: modifiersBitmask,
+  });
+  await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x: start[0],
+    y: start[1],
+    button: "left",
+    buttons: 1,
+    clickCount: 1,
+    modifiers: modifiersBitmask,
+  });
+
+  const dx = end[0] - start[0];
+  const dy = end[1] - start[1];
+  const distance = Math.hypot(dx, dy);
+  const steps = Math.max(8, Math.min(30, Math.round(distance / 20)));
+  for (let i = 1; i <= steps; i += 1) {
+    const t = i / steps;
+    const x = Math.round(start[0] + dx * t);
+    const y = Math.round(start[1] + dy * t);
+    await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x,
+      y,
+      buttons: 1,
+      modifiers: modifiersBitmask,
+    });
+  }
+
+  await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x: end[0],
+    y: end[1],
+    button: "left",
+    buttons: 0,
+    clickCount: 1,
+    modifiers: modifiersBitmask,
+  });
+}
+
+async function dispatchScroll(
+  debuggee: chrome.debugger.Debuggee,
+  coordinate: [number, number],
+  direction: "up" | "down" | "left" | "right",
+  amount: number,
+  modifiersBitmask: number
+) {
+  const tickPixels = 120;
+  const magnitude = Math.max(1, Math.round(amount)) * tickPixels;
+  const deltaX = direction === "left" ? -magnitude : direction === "right" ? magnitude : 0;
+  const deltaY = direction === "up" ? -magnitude : direction === "down" ? magnitude : 0;
+
+  await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+    type: "mouseWheel",
+    x: coordinate[0],
+    y: coordinate[1],
+    deltaX,
+    deltaY,
+    modifiers: modifiersBitmask,
+  });
+}
+
+function parseKeyToken(token: string) {
+  const parts = token
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 0) {
+    return null;
+  }
+
+  const modifierAliases: Record<string, ModifierName> = {
+    ctrl: "ctrl",
+    control: "ctrl",
+    shift: "shift",
+    alt: "alt",
+    cmd: "meta",
+    command: "meta",
+    meta: "meta",
+    win: "meta",
+    windows: "meta",
+  };
+
+  const modifiers = new Set<ModifierName>();
+  const keys: string[] = [];
+
+  for (const part of parts) {
+    const lowered = part.toLowerCase();
+    const modifier = modifierAliases[lowered];
+    if (modifier) {
+      modifiers.add(modifier);
+    } else {
+      keys.push(part);
+    }
+  }
+
+  if (keys.length > 1) {
+    return null;
+  }
+
+  if (keys.length === 0) {
+    const fallback = MODIFIER_ORDER.find((name) => modifiers.has(name));
+    if (!fallback) {
+      return null;
+    }
+    const fallbackKey = fallback === "ctrl"
+      ? "Control"
+      : fallback === "shift"
+      ? "Shift"
+      : fallback === "alt"
+      ? "Alt"
+      : "Meta";
+    return { modifiers: Array.from(modifiers), key: fallbackKey };
+  }
+
+  return { modifiers: Array.from(modifiers), key: keys[0] };
+}
+
+async function dispatchKeyToken(
+  debuggee: chrome.debugger.Debuggee,
+  token: string,
+  baseModifierBitmask: number
+) {
+  const parsed = parseKeyToken(token);
+  if (!parsed) {
+    return { ok: false as const, error: `Invalid key token '${token}'.` };
+  }
+
+  let tokenModifierBitmask = 0;
+  for (const mod of parsed.modifiers) {
+    tokenModifierBitmask |= MODIFIER_BITS[mod];
+  }
+
+  const keyDef = keyDefinitionFromName(parsed.key);
+  if (!keyDef) {
+    return { ok: false as const, error: `Unsupported key '${parsed.key}'.` };
+  }
+
+  const modifiers = baseModifierBitmask | tokenModifierBitmask;
+  const hasNonShiftModifier = (modifiers & (MODIFIER_BITS.alt | MODIFIER_BITS.ctrl | MODIFIER_BITS.meta)) !== 0;
+  const printableText = keyDef.text && !hasNonShiftModifier ? keyDef.text : undefined;
+
+  await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+    type: printableText ? "keyDown" : "rawKeyDown",
+    key: keyDef.key,
+    code: keyDef.code,
+    windowsVirtualKeyCode: keyDef.keyCode,
+    nativeVirtualKeyCode: keyDef.keyCode,
+    modifiers,
+    ...(printableText ? { text: printableText, unmodifiedText: printableText } : {}),
+  });
+  await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: keyDef.key,
+    code: keyDef.code,
+    windowsVirtualKeyCode: keyDef.keyCode,
+    nativeVirtualKeyCode: keyDef.keyCode,
+    modifiers,
+  });
+
+  return { ok: true as const, key: keyDef.key };
+}
+
+async function resolveRefToElement(
+  tabId: number,
+  ref: string,
+  scrollIntoView: boolean
+): Promise<
+  | { success: true; coordinate: [number, number]; element: ElementSummary }
+  | { success: false; error: string }
+> {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [ref, scrollIntoView],
+    func: (targetRef: string, shouldScroll: boolean) => {
+      const refHash = (input: string) => {
+        let hash = 0;
+        for (let i = 0; i < input.length; i += 1) {
+          hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+        }
+        return Math.abs(hash).toString(36);
+      };
+
+      const getRef = (path: string) => `ref_${refHash(path)}`;
+
+      const getType = (el: Element) => {
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        if (role) return role;
+        const tag = el.tagName.toLowerCase();
+        if (tag === "input") {
+          const inputType = (el.getAttribute("type") || "text").toLowerCase();
+          if (inputType === "checkbox") return "checkbox";
+          if (inputType === "radio") return "radio";
+          if (inputType === "search") return "searchbox";
+          return "textbox";
+        }
+        if (tag === "textarea") return "textbox";
+        if (tag === "a") return "link";
+        return tag;
+      };
+
+      const getName = (el: Element) => {
+        const aria = (el.getAttribute("aria-label") || "").trim();
+        if (aria) return aria;
+        const title = (el.getAttribute("title") || "").trim();
+        if (title) return title;
+        if (el instanceof HTMLInputElement && el.labels && el.labels.length > 0) {
+          const labelText = Array.from(el.labels)
+            .map((label) => (label.textContent || "").trim())
+            .filter(Boolean)
+            .join(" ");
+          if (labelText) return labelText;
+        }
+        const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+        return text.slice(0, 120);
+      };
+
+      const isVisible = (el: Element) => {
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const root = document.documentElement || document.body;
+      if (!root) {
+        return { success: false, error: "No document root found." };
+      }
+
+      const findByRef = (
+        el: Element,
+        path: string
+      ): { target: Element; path: string } | null => {
+        if (getRef(path) === targetRef) {
+          return { target: el, path };
+        }
+
+        const children = Array.from(el.children);
+        for (let i = 0; i < children.length; i += 1) {
+          const child = children[i];
+          const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+          const found = findByRef(child, childPath);
+          if (found) {
+            return found;
+          }
+        }
+        return null;
+      };
+
+      const found = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+      if (!found) {
+        return {
+          success: false,
+          error: "Element reference not found. Use read_page/find again to refresh refs.",
+        };
+      }
+
+      if (shouldScroll && found.target instanceof HTMLElement) {
+        found.target.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      }
+
+      const rect = found.target.getBoundingClientRect();
+      return {
+        success: true,
+        coordinate: [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2)],
+        element: {
+          ref: targetRef,
+          type: getType(found.target),
+          name: getName(found.target) || undefined,
+          visible: isVisible(found.target),
+        },
+      };
+    },
+  });
+
+  const result = injection?.result as
+    | { success: true; coordinate: [number, number]; element: ElementSummary }
+    | { success: false; error: string }
+    | undefined;
+
+  return (
+    result ?? {
+      success: false,
+      error: "Failed to resolve element reference.",
+    }
+  );
+}
+
+async function describeElementAtCoordinate(tabId: number, coordinate: [number, number]) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [coordinate[0], coordinate[1]],
+    func: (x: number, y: number) => {
+      const refHash = (input: string) => {
+        let hash = 0;
+        for (let i = 0; i < input.length; i += 1) {
+          hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+        }
+        return Math.abs(hash).toString(36);
+      };
+
+      const buildPath = (el: Element) => {
+        const segments: string[] = [];
+        let current: Element | null = el;
+        while (current) {
+          const parent = current.parentElement;
+          const index = parent ? Array.from(parent.children).indexOf(current) : 0;
+          segments.push(`${current.tagName.toLowerCase()}:${Math.max(index, 0)}`);
+          if (!parent) break;
+          current = parent;
+        }
+        return segments.reverse().join(">");
+      };
+
+      const getType = (el: Element) => {
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        if (role) return role;
+        const tag = el.tagName.toLowerCase();
+        if (tag === "input") {
+          const inputType = (el.getAttribute("type") || "text").toLowerCase();
+          if (inputType === "checkbox") return "checkbox";
+          if (inputType === "radio") return "radio";
+          if (inputType === "search") return "searchbox";
+          return "textbox";
+        }
+        if (tag === "textarea") return "textbox";
+        if (tag === "a") return "link";
+        return tag;
+      };
+
+      const getName = (el: Element) => {
+        const aria = (el.getAttribute("aria-label") || "").trim();
+        if (aria) return aria;
+        const title = (el.getAttribute("title") || "").trim();
+        if (title) return title;
+        if (el instanceof HTMLInputElement && el.labels && el.labels.length > 0) {
+          const labelText = Array.from(el.labels)
+            .map((label) => (label.textContent || "").trim())
+            .filter(Boolean)
+            .join(" ");
+          if (labelText) return labelText;
+        }
+        const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+        return text.slice(0, 120);
+      };
+
+      const isVisible = (el: Element) => {
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+
+      const element = document.elementFromPoint(x, y);
+      if (!element) {
+        return { element: null, tooltipShown: false };
+      }
+
+      const path = buildPath(element);
+      const tooltip = (element.getAttribute("title") || "").trim();
+
+      return {
+        element: {
+          ref: `ref_${refHash(path)}`,
+          type: getType(element),
+          name: getName(element) || undefined,
+          visible: isVisible(element),
+        },
+        tooltipShown: Boolean(tooltip),
+        tooltipText: tooltip || undefined,
+      };
+    },
+  });
+
+  const result = injection?.result as
+    | { element: ElementSummary | null; tooltipShown: boolean; tooltipText?: string }
+    | undefined;
+  return result ?? { element: null, tooltipShown: false };
+}
+
+async function readActiveFieldValue(tabId: number) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const active = document.activeElement;
+      if (!active) {
+        return { hasActiveField: false };
+      }
+
+      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+        return {
+          hasActiveField: true,
+          value: active.value ?? "",
+          inputType: active instanceof HTMLInputElement ? active.type : "textarea",
+        };
+      }
+
+      if (active instanceof HTMLElement && active.isContentEditable) {
+        return {
+          hasActiveField: true,
+          value: active.textContent ?? "",
+          inputType: "contenteditable",
+        };
+      }
+
+      return { hasActiveField: false };
+    },
+  });
+
+  return (
+    (injection?.result as { hasActiveField: boolean; value?: string; inputType?: string } | undefined) ??
+    { hasActiveField: false }
+  );
+}
+
+async function getScrollMetrics(tabId: number) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => ({
+      scrollX: Math.round(window.scrollX),
+      scrollY: Math.round(window.scrollY),
+      pageWidth: Math.round(
+        Math.max(document.body?.scrollWidth ?? 0, document.documentElement?.scrollWidth ?? 0)
+      ),
+      pageHeight: Math.round(
+        Math.max(document.body?.scrollHeight ?? 0, document.documentElement?.scrollHeight ?? 0)
+      ),
+    }),
+  });
+
+  return (
+    (injection?.result as { scrollX: number; scrollY: number; pageWidth: number; pageHeight: number } | undefined) ??
+    { scrollX: 0, scrollY: 0, pageWidth: 0, pageHeight: 0 }
+  );
+}
+
+async function getViewportMetrics(tabId: number) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => ({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio || 1,
+    }),
+  });
+
+  return (
+    (injection?.result as { width: number; height: number; devicePixelRatio: number } | undefined) ??
+    { width: 0, height: 0, devicePixelRatio: 1 }
+  );
+}
+
+async function captureTabScreenshotDataUrl(tabId: number) {
+  return withDebuggerSession(tabId, async (debuggee) => {
+    await chrome.debugger.sendCommand(debuggee, "Page.enable");
+    const capture = (await chrome.debugger.sendCommand(debuggee, "Page.captureScreenshot", {
+      format: "png",
+    })) as { data?: string };
+
+    if (!capture.data) {
+      throw new Error("Screenshot capture returned no image data.");
+    }
+
+    return `data:image/png;base64,${capture.data}`;
+  });
+}
+
+async function dataUrlToBlob(dataUrl: string) {
+  const response = await fetch(dataUrl);
+  return response.blob();
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...Array.from(chunk));
+  }
+  return btoa(binary);
+}
+
+async function blobToDataUrl(blob: Blob) {
+  const buffer = await blob.arrayBuffer();
+  const base64 = bytesToBase64(new Uint8Array(buffer));
+  return `data:${blob.type || "application/octet-stream"};base64,${base64}`;
+}
+
+async function getImageDimensions(dataUrl: string) {
+  const blob = await dataUrlToBlob(dataUrl);
+  const bitmap = await createImageBitmap(blob);
+  const width = bitmap.width;
+  const height = bitmap.height;
+  bitmap.close();
+  return { width, height };
+}
+
+async function cropImageDataUrl(
+  dataUrl: string,
+  crop: { x: number; y: number; width: number; height: number }
+) {
+  const blob = await dataUrlToBlob(dataUrl);
+  const bitmap = await createImageBitmap(blob);
+  const canvas = new OffscreenCanvas(crop.width, crop.height);
+  const context = canvas.getContext("2d");
+  if (!context) {
+    bitmap.close();
+    throw new Error("Unable to initialize 2D context for zoom crop.");
+  }
+
+  context.drawImage(
+    bitmap,
+    crop.x,
+    crop.y,
+    crop.width,
+    crop.height,
+    0,
+    0,
+    crop.width,
+    crop.height
+  );
+  bitmap.close();
+
+  const outBlob = await canvas.convertToBlob({ type: "image/png" });
+  return blobToDataUrl(outBlob);
+}
+
 const tabsContextTool = tool(
   async () => {
     const [initialTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -918,6 +1802,671 @@ const findTool = tool(
   }
 );
 
+const formInputTool = tool(
+  async ({ ref, value, tabId }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        success: false,
+        action: "form_input",
+        tabId,
+        ref,
+        error: scope.error,
+      });
+    }
+
+    try {
+      const [injection] = await chrome.scripting.executeScript({
+        target: { tabId },
+        args: [ref, value],
+        func: (targetRef: string, nextValue: string | boolean | number) => {
+          const refHash = (input: string) => {
+            let hash = 0;
+            for (let i = 0; i < input.length; i += 1) {
+              hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+            }
+            return Math.abs(hash).toString(36);
+          };
+
+          const getRef = (path: string) => `ref_${refHash(path)}`;
+
+          const root = document.documentElement || document.body;
+          if (!root) {
+            return {
+              success: false,
+              action: "form_input",
+              ref: targetRef,
+              error: "No document root found.",
+            };
+          }
+
+          const findByRef = (el: Element, path: string): Element | null => {
+            if (getRef(path) === targetRef) return el;
+
+            const children = Array.from(el.children);
+            for (let i = 0; i < children.length; i += 1) {
+              const child = children[i];
+              const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+              const found = findByRef(child, childPath);
+              if (found) return found;
+            }
+            return null;
+          };
+
+          const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+          if (!target) {
+            return {
+              success: false,
+              action: "form_input",
+              ref: targetRef,
+              error: "Element reference not found. Use read_page or find again to refresh refs.",
+            };
+          }
+
+          const fireValueEvents = (el: Element) => {
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          };
+
+          const toBoolean = (input: unknown) => {
+            if (typeof input === "boolean") return input;
+            if (typeof input === "number") return input !== 0;
+            if (typeof input === "string") {
+              const lowered = input.trim().toLowerCase();
+              if (["true", "1", "yes", "on"].includes(lowered)) return true;
+              if (["false", "0", "no", "off", ""].includes(lowered)) return false;
+            }
+            return Boolean(input);
+          };
+
+          if (target instanceof HTMLInputElement) {
+            const inputType = (target.type || "text").toLowerCase();
+            if (inputType === "checkbox" || inputType === "radio") {
+              target.checked = toBoolean(nextValue);
+            } else {
+              target.value = String(nextValue ?? "");
+            }
+            fireValueEvents(target);
+            return {
+              success: true,
+              action: "form_input",
+              ref: targetRef,
+              elementType: "input",
+              inputType,
+              value: inputType === "checkbox" || inputType === "radio" ? target.checked : target.value,
+            };
+          }
+
+          if (target instanceof HTMLTextAreaElement) {
+            target.value = String(nextValue ?? "");
+            fireValueEvents(target);
+            return {
+              success: true,
+              action: "form_input",
+              ref: targetRef,
+              elementType: "textarea",
+              value: target.value,
+            };
+          }
+
+          if (target instanceof HTMLSelectElement) {
+            const needle = String(nextValue ?? "").trim();
+            const options = Array.from(target.options);
+            const exactValue = options.find((o) => o.value === needle);
+            const exactText = options.find((o) => o.text.trim() === needle);
+            const ciText = options.find((o) => o.text.trim().toLowerCase() === needle.toLowerCase());
+            const matched = exactValue ?? exactText ?? ciText ?? null;
+            if (!matched) {
+              return {
+                success: false,
+                action: "form_input",
+                ref: targetRef,
+                error: "No matching select option by value or text.",
+                availableOptions: options.map((o) => ({ value: o.value, text: o.text })),
+              };
+            }
+            target.value = matched.value;
+            fireValueEvents(target);
+            return {
+              success: true,
+              action: "form_input",
+              ref: targetRef,
+              elementType: "select",
+              value: target.value,
+              selectedText: matched.text,
+            };
+          }
+
+          if (target instanceof HTMLElement && target.isContentEditable) {
+            target.textContent = String(nextValue ?? "");
+            fireValueEvents(target);
+            return {
+              success: true,
+              action: "form_input",
+              ref: targetRef,
+              elementType: "contenteditable",
+              value: target.textContent ?? "",
+            };
+          }
+
+          return {
+            success: false,
+            action: "form_input",
+            ref: targetRef,
+            error: "Referenced element is not a supported form input type.",
+            tagName: target.tagName.toLowerCase(),
+          };
+        },
+      });
+
+      const payload =
+        injection?.result ??
+        ({
+          success: false,
+          action: "form_input",
+          tabId,
+          ref,
+          error: "No result returned from page evaluation.",
+        } as const);
+
+      return JSON.stringify({
+        ...((payload as Record<string, unknown>) ?? {}),
+        tabId,
+      });
+    } catch (error) {
+      return JSON.stringify({
+        success: false,
+        action: "form_input",
+        tabId,
+        ref,
+        error: String(error),
+      });
+    }
+  },
+  {
+    name: "form_input",
+    description:
+      "Set values in form elements using a read_page/find ref. Requires ref, value (string|boolean|number), and tabId from tabs_context.",
+    schema: z.object({
+      ref: z.string().min(1).describe("Element reference ID from read_page tool (e.g., 'ref_1')."),
+      value: z
+        .union([z.string(), z.boolean(), z.number()])
+        .describe(
+          "Value to set. For checkboxes/radios prefer boolean; for selects use option value or visible text; for other inputs use string/number."
+        ),
+      tabId: z.number().int().describe("Tab ID to set form value in. Must be in current tab group/context."),
+    }),
+  }
+);
+
+const computerTool = tool(
+  async ({
+    action,
+    tabId,
+    coordinate,
+    duration,
+    modifiers,
+    ref,
+    region,
+    repeat,
+    scroll_amount,
+    scroll_direction,
+    start_coordinate,
+    text,
+  }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        success: false,
+        action,
+        tabId,
+        error: scope.error,
+      });
+    }
+
+    return withTabActionLock(tabId, async () => {
+      const fail = (message: string, extras: Record<string, unknown> = {}) =>
+        JSON.stringify({
+          success: false,
+          action,
+          tabId,
+          ...extras,
+          error: message,
+        });
+
+      const resolveCoordinateFromInputs = async (options: {
+        allowRef: boolean;
+        refRequired?: boolean;
+        coordinateValue?: [number, number];
+        refValue?: string;
+        scrollIntoView?: boolean;
+      }) => {
+        if (options.coordinateValue) {
+          return {
+            ok: true as const,
+            coordinate: normalizePoint(options.coordinateValue),
+            fromRef: false,
+          };
+        }
+
+        if (options.allowRef && options.refValue) {
+          const resolved = await resolveRefToElement(tabId, options.refValue, Boolean(options.scrollIntoView));
+          if (!resolved.success) {
+            return { ok: false as const, error: resolved.error };
+          }
+          return {
+            ok: true as const,
+            coordinate: resolved.coordinate,
+            fromRef: true,
+            element: resolved.element,
+          };
+        }
+
+        if (options.refRequired) {
+          return { ok: false as const, error: "Parameter 'ref' is required for this action." };
+        }
+
+        return {
+          ok: false as const,
+          error: "Provide either 'coordinate' or 'ref' for this action.",
+        };
+      };
+
+      try {
+        if (action === "screenshot") {
+          const dataUrl = await captureTabScreenshotDataUrl(tabId);
+          const dimensions = await getImageDimensions(dataUrl);
+          const imageId = storeScreenshot(
+            tabId,
+            "screenshot",
+            dataUrl,
+            dimensions.width,
+            dimensions.height
+          );
+
+          return JSON.stringify({
+            success: true,
+            action,
+            tabId,
+            imageId,
+            mimeType: "image/png",
+            width: dimensions.width,
+            height: dimensions.height,
+          });
+        }
+
+        if (action === "zoom") {
+          if (!region) {
+            return fail("Parameter 'region' is required for action 'zoom'.");
+          }
+
+          const normalized = normalizeRegion(region);
+          if (normalized.width <= 0 || normalized.height <= 0) {
+            return fail("Invalid 'region'. Ensure x0 != x1 and y0 != y1.", { region });
+          }
+
+          const sourceDataUrl = await captureTabScreenshotDataUrl(tabId);
+          const sourceDimensions = await getImageDimensions(sourceDataUrl);
+          const viewport = await getViewportMetrics(tabId);
+          const viewportWidth = viewport.width > 0 ? viewport.width : sourceDimensions.width;
+          const viewportHeight = viewport.height > 0 ? viewport.height : sourceDimensions.height;
+          const scaleX = sourceDimensions.width / Math.max(1, viewportWidth);
+          const scaleY = sourceDimensions.height / Math.max(1, viewportHeight);
+
+          const cropX = Math.max(
+            0,
+            Math.min(sourceDimensions.width - 1, Math.round(normalized.left * scaleX))
+          );
+          const cropY = Math.max(
+            0,
+            Math.min(sourceDimensions.height - 1, Math.round(normalized.top * scaleY))
+          );
+          const cropWidth = Math.max(
+            1,
+            Math.min(sourceDimensions.width - cropX, Math.round(normalized.width * scaleX))
+          );
+          const cropHeight = Math.max(
+            1,
+            Math.min(sourceDimensions.height - cropY, Math.round(normalized.height * scaleY))
+          );
+
+          const zoomedDataUrl = await cropImageDataUrl(sourceDataUrl, {
+            x: cropX,
+            y: cropY,
+            width: cropWidth,
+            height: cropHeight,
+          });
+
+          const imageId = storeScreenshot(
+            tabId,
+            "zoom",
+            zoomedDataUrl,
+            cropWidth,
+            cropHeight,
+            [normalized.left, normalized.top, normalized.right, normalized.bottom]
+          );
+
+          return JSON.stringify({
+            success: true,
+            action,
+            tabId,
+            imageId,
+            mimeType: "image/png",
+            region: [normalized.left, normalized.top, normalized.right, normalized.bottom],
+            zoomDimensions: {
+              width: cropWidth,
+              height: cropHeight,
+            },
+          });
+        }
+
+        if (action === "wait") {
+          if (typeof duration !== "number") {
+            return fail("Parameter 'duration' is required for action 'wait'.");
+          }
+          if (duration <= 0 || duration > 30) {
+            return fail("Parameter 'duration' must be > 0 and <= 30 seconds.", { duration });
+          }
+
+          await sleep(Math.round(duration * 1000));
+          return JSON.stringify({
+            success: true,
+            action,
+            tabId,
+            durationSeconds: duration,
+            completed: true,
+          });
+        }
+
+        if (action === "scroll_to") {
+          const resolved = await resolveCoordinateFromInputs({
+            allowRef: true,
+            refRequired: true,
+            refValue: ref,
+            scrollIntoView: true,
+          });
+          if (!resolved.ok) {
+            return fail(resolved.error, { ref });
+          }
+
+          return JSON.stringify({
+            success: true,
+            action,
+            tabId,
+            ref,
+            elementScrolledIntoView: true,
+            newPosition: resolved.coordinate,
+          });
+        }
+
+        if (action === "type") {
+          if (typeof text !== "string") {
+            return fail("Parameter 'text' is required for action 'type'.");
+          }
+
+          await withDebuggerSession(tabId, async (debuggee) => {
+            await chrome.debugger.sendCommand(debuggee, "Input.insertText", { text });
+          });
+          const activeField = await readActiveFieldValue(tabId);
+
+          return JSON.stringify({
+            success: true,
+            action,
+            tabId,
+            textEntered: text,
+            ...(activeField.hasActiveField ? { currentFieldValue: activeField.value ?? "" } : {}),
+            ...(activeField.inputType === "email"
+              ? { validEmail: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(activeField.value ?? "") }
+              : {}),
+          });
+        }
+
+        if (action === "key") {
+          if (typeof text !== "string" || !text.trim()) {
+            return fail("Parameter 'text' is required for action 'key'.");
+          }
+
+          const repeatCount = repeat ?? 1;
+          if (!Number.isInteger(repeatCount) || repeatCount < 1 || repeatCount > 100) {
+            return fail("Parameter 'repeat' must be an integer between 1 and 100.", { repeat });
+          }
+
+          const parsedModifiers = parseModifierString(modifiers);
+          if (!parsedModifiers.ok) {
+            return fail(parsedModifiers.error);
+          }
+
+          const tokens = text.split(/\s+/).filter(Boolean);
+          if (tokens.length === 0) {
+            return fail("No keys provided. Use space-separated keys in 'text'.");
+          }
+
+          const executedTokens: string[] = [];
+          await withDebuggerSession(tabId, async (debuggee) => {
+            for (let pass = 0; pass < repeatCount; pass += 1) {
+              for (const token of tokens) {
+                const dispatched = await dispatchKeyToken(debuggee, token, parsedModifiers.bitmask);
+                if (!dispatched.ok) {
+                  throw new Error(dispatched.error);
+                }
+                executedTokens.push(token);
+              }
+            }
+          });
+
+          const activeField = await readActiveFieldValue(tabId);
+          return JSON.stringify({
+            success: true,
+            action,
+            tabId,
+            keysPressed: tokens,
+            repeatCount,
+            ...(parsedModifiers.normalized ? { modifiers: parsedModifiers.normalized } : {}),
+            ...(activeField.hasActiveField ? { currentFieldValue: activeField.value ?? "" } : {}),
+          });
+        }
+
+        if (
+          action === "left_click" ||
+          action === "right_click" ||
+          action === "double_click" ||
+          action === "triple_click" ||
+          action === "hover"
+        ) {
+          const parsedModifiers = parseModifierString(modifiers);
+          if (!parsedModifiers.ok) {
+            return fail(parsedModifiers.error);
+          }
+
+          const resolved = await resolveCoordinateFromInputs({
+            allowRef: true,
+            coordinateValue: coordinate,
+            refValue: ref,
+            scrollIntoView: action !== "hover",
+          });
+          if (!resolved.ok) {
+            return fail(resolved.error, { ref });
+          }
+
+          if (action === "hover") {
+            await withDebuggerSession(tabId, async (debuggee) => {
+              await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+                type: "mouseMoved",
+                x: resolved.coordinate[0],
+                y: resolved.coordinate[1],
+                modifiers: parsedModifiers.bitmask,
+              });
+            });
+
+            const hoverInfo = await describeElementAtCoordinate(tabId, resolved.coordinate);
+            return JSON.stringify({
+              success: true,
+              action,
+              tabId,
+              ...(resolved.fromRef ? { ref } : { coordinate: resolved.coordinate }),
+              ...(hoverInfo.element ? { hoverElement: hoverInfo.element } : {}),
+              tooltipShown: hoverInfo.tooltipShown,
+              ...(hoverInfo.tooltipText ? { tooltipText: hoverInfo.tooltipText } : {}),
+            });
+          }
+
+          const clickCount = action === "double_click" ? 2 : action === "triple_click" ? 3 : 1;
+          const button = action === "right_click" ? "right" : "left";
+          await withDebuggerSession(tabId, async (debuggee) => {
+            await dispatchClick(debuggee, resolved.coordinate, button, clickCount, parsedModifiers.bitmask);
+          });
+
+          const clickInfo = await describeElementAtCoordinate(tabId, resolved.coordinate);
+          return JSON.stringify({
+            success: true,
+            action,
+            tabId,
+            ...(resolved.fromRef ? { ref } : { coordinate: resolved.coordinate }),
+            ...(parsedModifiers.normalized ? { modifiers: parsedModifiers.normalized } : {}),
+            ...(clickInfo.element ? { clickedElement: clickInfo.element } : {}),
+            ...(action === "right_click" ? { contextMenuOpened: true } : {}),
+          });
+        }
+
+        if (action === "scroll") {
+          if (!coordinate) {
+            return fail("Parameter 'coordinate' is required for action 'scroll'.");
+          }
+          if (!scroll_direction) {
+            return fail("Parameter 'scroll_direction' is required for action 'scroll'.");
+          }
+          const amount = scroll_amount ?? 3;
+          if (amount <= 0) {
+            return fail("Parameter 'scroll_amount' must be a positive number.", { scroll_amount });
+          }
+
+          const parsedModifiers = parseModifierString(modifiers);
+          if (!parsedModifiers.ok) {
+            return fail(parsedModifiers.error);
+          }
+
+          const point = normalizePoint(coordinate);
+          await withDebuggerSession(tabId, async (debuggee) => {
+            await dispatchScroll(debuggee, point, scroll_direction, amount, parsedModifiers.bitmask);
+          });
+          const metrics = await getScrollMetrics(tabId);
+
+          return JSON.stringify({
+            success: true,
+            action,
+            tabId,
+            coordinate: point,
+            direction: scroll_direction,
+            scrollAmount: amount,
+            ...(scroll_direction === "left" || scroll_direction === "right"
+              ? { newHorizontalPosition: metrics.scrollX, pageWidth: metrics.pageWidth }
+              : { newScrollPosition: metrics.scrollY, pageHeight: metrics.pageHeight }),
+          });
+        }
+
+        if (action === "left_click_drag") {
+          if (!start_coordinate || !coordinate) {
+            return fail(
+              "Parameters 'start_coordinate' and 'coordinate' are required for action 'left_click_drag'."
+            );
+          }
+
+          const parsedModifiers = parseModifierString(modifiers);
+          if (!parsedModifiers.ok) {
+            return fail(parsedModifiers.error);
+          }
+
+          const start = normalizePoint(start_coordinate);
+          const end = normalizePoint(coordinate);
+          await withDebuggerSession(tabId, async (debuggee) => {
+            await dispatchDrag(debuggee, start, end, parsedModifiers.bitmask);
+          });
+
+          return JSON.stringify({
+            success: true,
+            action,
+            tabId,
+            startCoordinate: start,
+            endCoordinate: end,
+            distanceMoved: Math.round(Math.hypot(end[0] - start[0], end[1] - start[1])),
+            dropCompleted: true,
+            ...(parsedModifiers.normalized ? { modifiers: parsedModifiers.normalized } : {}),
+          });
+        }
+
+        return fail(`Unsupported action '${action}'.`);
+      } catch (error) {
+        return fail(String(error), {
+          ...(ref ? { ref } : {}),
+          ...(coordinate ? { coordinate: normalizePoint(coordinate) } : {}),
+        });
+      }
+    });
+  },
+  {
+    name: "computer",
+    description:
+      "Use mouse/keyboard actions and screenshots on a tab. Supports left/right/double/triple click, type, screenshot, wait, scroll, key, left_click_drag, zoom, scroll_to, and hover.",
+    schema: z.object({
+      action: z
+        .enum(COMPUTER_ACTIONS)
+        .describe(
+          "Action to perform. Options: left_click, right_click, double_click, triple_click, type, screenshot, wait, scroll, key, left_click_drag, zoom, scroll_to, hover."
+        ),
+      tabId: z.number().int().describe("Tab ID to execute action on. Must be in current tab group/context."),
+      coordinate: z
+        .array(z.number())
+        .length(2)
+        .optional()
+        .describe(
+          "Viewport coordinates [x, y]. Required for click/right_click/double_click/triple_click/scroll. Used as end position for left_click_drag."
+        ),
+      duration: z.number().optional().describe("Wait duration in seconds for action='wait'. Maximum 30."),
+      modifiers: z
+        .string()
+        .optional()
+        .describe(
+          "Modifier keys (ctrl, shift, alt, cmd/meta, win/windows). Combine with '+' (e.g., ctrl+shift)."
+        ),
+      ref: z
+        .string()
+        .optional()
+        .describe(
+          "Element ref from read_page/find. Required for scroll_to, and usable as alternative to coordinate for click/hover."
+        ),
+      region: z
+        .array(z.number())
+        .length(4)
+        .optional()
+        .describe("Zoom region [x0, y0, x1, y1], required for action='zoom'."),
+      repeat: z
+        .number()
+        .int()
+        .optional()
+        .describe("Repeat count for action='key'. Integer between 1 and 100, default 1."),
+      scroll_amount: z
+        .number()
+        .optional()
+        .describe("Number of scroll ticks for action='scroll'. Defaults to 3."),
+      scroll_direction: z
+        .enum(["up", "down", "left", "right"])
+        .optional()
+        .describe("Scroll direction for action='scroll'."),
+      start_coordinate: z
+        .array(z.number())
+        .length(2)
+        .optional()
+        .describe("Start coordinate [x, y] for action='left_click_drag'."),
+      text: z
+        .string()
+        .optional()
+        .describe(
+          "Text for action='type', or key sequence for action='key'. Key sequences are space-separated (e.g., 'Backspace Backspace Delete' or 'ctrl+a')."
+        ),
+    }),
+  }
+);
+
 const turnAnswerStartTool = tool(
   async () => {
     return JSON.stringify({
@@ -1029,6 +2578,8 @@ const tools = [
   tabsCreateTool,
   readPageTool,
   findTool,
+  formInputTool,
+  computerTool,
   navigateTool,
   resizeWindowTool,
   getPageTextTool,
@@ -1263,6 +2814,8 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call tabs_create to create a new tab in the current tab group/context. " +
         "Call read_page with tabId and optional depth/filter/max_chars/ref_id to inspect page structure and get ref IDs. " +
         "Call find with tabId and a natural language query to locate matching elements quickly. " +
+        "Call form_input with tabId, ref, and value to set form fields (including inputs, selects, and textareas). " +
+        "Call computer with action and tabId for mouse/keyboard interactions, scrolling, waiting, drag, hover, screenshots, and zoom. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +
