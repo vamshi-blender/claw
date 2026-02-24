@@ -1082,6 +1082,17 @@ type ConsoleCapturedMessage = {
   url?: string;
 };
 
+type NetworkCapturedRequest = {
+  url: string;
+  method: string;
+  resourceType: string;
+  statusCode?: number;
+  responseTime?: number;
+  size?: number;
+  timestamp: string;
+  requestBody?: string;
+};
+
 async function ensureConsoleMonitor(tabId: number) {
   await chrome.scripting.executeScript({
     target: { tabId },
@@ -1236,6 +1247,252 @@ async function readConsoleBuffer(tabId: number, clear: boolean) {
   });
 
   return (injection?.result as ConsoleCapturedMessage[] | undefined) ?? [];
+}
+
+async function ensureNetworkMonitor(tabId: number) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: () => {
+      type ClawNetworkStore = {
+        installed: boolean;
+        currentOrigin: string;
+        entries: NetworkCapturedRequest[];
+        maxEntries: number;
+        seenPerfKeys: Record<string, true>;
+      };
+
+      const globalObj = window as unknown as {
+        __clawNetworkStore?: ClawNetworkStore;
+      };
+
+      const createStore = (): ClawNetworkStore => ({
+        installed: false,
+        currentOrigin: window.location.origin,
+        entries: [],
+        maxEntries: 3000,
+        seenPerfKeys: {},
+      });
+
+      const store = globalObj.__clawNetworkStore ?? createStore();
+      globalObj.__clawNetworkStore = store;
+
+      if (store.currentOrigin !== window.location.origin) {
+        store.currentOrigin = window.location.origin;
+        store.entries = [];
+        store.seenPerfKeys = {};
+      }
+
+      const pushEntry = (entry: Omit<NetworkCapturedRequest, "timestamp">) => {
+        store.entries.push({
+          ...entry,
+          timestamp: new Date().toISOString(),
+        });
+        if (store.entries.length > store.maxEntries) {
+          store.entries.splice(0, store.entries.length - store.maxEntries);
+        }
+      };
+
+      const normalizeUrl = (raw: string) => {
+        try {
+          return new URL(raw, window.location.href).href;
+        } catch {
+          return raw;
+        }
+      };
+
+      const capturePerformanceEntries = () => {
+        const nav = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
+        if (nav) {
+          const key = `nav:${Math.round(nav.startTime)}:${Math.round(nav.responseEnd)}:${window.location.href}`;
+          if (!store.seenPerfKeys[key]) {
+            store.seenPerfKeys[key] = true;
+            pushEntry({
+              url: window.location.href,
+              method: "GET",
+              resourceType: "document",
+              statusCode: undefined,
+              responseTime: Math.round(nav.duration || 0),
+              size: nav.transferSize > 0 ? nav.transferSize : undefined,
+            });
+          }
+        }
+
+        const resources = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+        for (const resource of resources) {
+          const key = `res:${resource.name}:${Math.round(resource.startTime)}:${Math.round(resource.responseEnd)}`;
+          if (store.seenPerfKeys[key]) {
+            continue;
+          }
+          store.seenPerfKeys[key] = true;
+
+          pushEntry({
+            url: normalizeUrl(resource.name),
+            method: "GET",
+            resourceType: resource.initiatorType || "resource",
+            statusCode: undefined,
+            responseTime: Math.round(resource.duration || 0),
+            size: resource.transferSize > 0 ? resource.transferSize : undefined,
+          });
+        }
+      };
+
+      capturePerformanceEntries();
+
+      if (store.installed) {
+        return;
+      }
+
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = async (...args: Parameters<typeof fetch>) => {
+        const start = performance.now();
+        const requestInfo = args[0];
+        const requestInit = args[1];
+
+        let method = "GET";
+        let url = "";
+        if (requestInfo instanceof Request) {
+          method = requestInfo.method || method;
+          url = requestInfo.url;
+        } else {
+          url = String(requestInfo);
+        }
+        if (requestInit?.method) {
+          method = requestInit.method;
+        }
+
+        const requestBody = typeof requestInit?.body === "string" ? requestInit.body : undefined;
+
+        try {
+          const response = await originalFetch(...args);
+          const elapsed = Math.round(performance.now() - start);
+          const contentLength = response.headers.get("content-length");
+          const parsedSize = contentLength ? Number.parseInt(contentLength, 10) : NaN;
+
+          pushEntry({
+            url: normalizeUrl(response.url || url),
+            method: method.toUpperCase(),
+            resourceType: "fetch",
+            statusCode: response.status,
+            responseTime: elapsed,
+            size: Number.isFinite(parsedSize) ? parsedSize : undefined,
+            ...(requestBody ? { requestBody } : {}),
+          });
+          return response;
+        } catch (error) {
+          const elapsed = Math.round(performance.now() - start);
+          pushEntry({
+            url: normalizeUrl(url),
+            method: method.toUpperCase(),
+            resourceType: "fetch",
+            statusCode: 0,
+            responseTime: elapsed,
+            ...(requestBody ? { requestBody } : {}),
+          });
+          throw error;
+        }
+      };
+
+      const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (
+        method: string,
+        url: string | URL,
+        async?: boolean,
+        username?: string | null,
+        password?: string | null
+      ) {
+        (this as XMLHttpRequest & { __clawMeta?: Record<string, unknown> }).__clawMeta = {
+          method: (method || "GET").toUpperCase(),
+          url: typeof url === "string" ? url : url.toString(),
+          start: 0,
+          body: undefined,
+        };
+        return originalOpen.call(this, method, url as string, async ?? true, username ?? null, password ?? null);
+      };
+
+      XMLHttpRequest.prototype.send = function (body?: Document | XMLHttpRequestBodyInit | null) {
+        const xhr = this as XMLHttpRequest & { __clawMeta?: Record<string, unknown> };
+        if (xhr.__clawMeta) {
+          xhr.__clawMeta.start = performance.now();
+          if (typeof body === "string") {
+            xhr.__clawMeta.body = body;
+          }
+        }
+
+        const onLoadEnd = () => {
+          const meta = xhr.__clawMeta ?? {};
+          const startedAt = typeof meta.start === "number" ? meta.start : performance.now();
+          const elapsed = Math.round(performance.now() - startedAt);
+          let size: number | undefined;
+          try {
+            const response = xhr.response;
+            if (response instanceof ArrayBuffer) {
+              size = response.byteLength;
+            } else if (typeof response === "string") {
+              size = response.length;
+            } else if (response && typeof (response as Blob).size === "number") {
+              size = (response as Blob).size;
+            }
+          } catch {
+            size = undefined;
+          }
+
+          pushEntry({
+            url: normalizeUrl(String(xhr.responseURL || meta.url || "")),
+            method: String(meta.method || "GET").toUpperCase(),
+            resourceType: "xhr",
+            statusCode: Number.isFinite(xhr.status) ? xhr.status : undefined,
+            responseTime: elapsed,
+            ...(typeof size === "number" && size >= 0 ? { size } : {}),
+            ...(typeof meta.body === "string" ? { requestBody: meta.body } : {}),
+          });
+          xhr.removeEventListener("loadend", onLoadEnd);
+        };
+
+        xhr.addEventListener("loadend", onLoadEnd);
+        return originalSend.call(this, body ?? null);
+      };
+
+      store.installed = true;
+    },
+  });
+}
+
+async function readNetworkBuffer(tabId: number, clear: boolean) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    args: [clear],
+    func: (clearEntries: boolean) => {
+      const globalObj = window as unknown as {
+        __clawNetworkStore?: {
+          currentOrigin: string;
+          entries: NetworkCapturedRequest[];
+          seenPerfKeys: Record<string, true>;
+        };
+      };
+
+      const store = globalObj.__clawNetworkStore;
+      if (!store) {
+        return [] as NetworkCapturedRequest[];
+      }
+
+      if (store.currentOrigin !== window.location.origin) {
+        store.currentOrigin = window.location.origin;
+        store.entries = [];
+        store.seenPerfKeys = {};
+      }
+
+      const entries = Array.isArray(store.entries) ? [...store.entries] : [];
+      if (clearEntries) {
+        store.entries = [];
+      }
+      return entries;
+    },
+  });
+
+  return (injection?.result as NetworkCapturedRequest[] | undefined) ?? [];
 }
 
 async function readUploadedFilesFromInput(tabId: number, ref: string) {
@@ -1456,6 +1713,11 @@ const tabsContextTool = tool(
 
     try {
       await ensureConsoleMonitor(initialTab.id);
+    } catch {
+      // Best effort only.
+    }
+    try {
+      await ensureNetworkMonitor(initialTab.id);
     } catch {
       // Best effort only.
     }
@@ -3471,6 +3733,104 @@ const readConsoleMessagesTool = tool(
   }
 );
 
+const readNetworkRequestsTool = tool(
+  async ({ tabId, limit, clear, urlPattern }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        success: false,
+        action: "read_network_requests",
+        tabId,
+        error: scope.error,
+      });
+    }
+
+    const fail = (message: string, extras: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        success: false,
+        action: "read_network_requests",
+        tabId,
+        ...extras,
+        error: message,
+      });
+
+    const appliedLimit = typeof limit === "number" ? Math.max(1, Math.floor(limit)) : 100;
+    const shouldClear = Boolean(clear);
+    const pattern = typeof urlPattern === "string" ? urlPattern : undefined;
+
+    try {
+      await ensureNetworkMonitor(tabId);
+
+      let rawEntries = await readNetworkBuffer(tabId, false);
+      if (rawEntries.length === 0) {
+        await sleep(250);
+        rawEntries = await readNetworkBuffer(tabId, false);
+      }
+
+      const filtered = rawEntries
+        .filter((entry) => {
+          if (!entry || typeof entry.url !== "string") {
+            return false;
+          }
+          if (pattern && !entry.url.includes(pattern)) {
+            return false;
+          }
+          return true;
+        })
+        .slice(-appliedLimit)
+        .map((entry) => ({
+          url: entry.url,
+          method: entry.method || "GET",
+          resourceType: entry.resourceType || "resource",
+          ...(typeof entry.statusCode === "number" ? { statusCode: entry.statusCode } : {}),
+          ...(typeof entry.responseTime === "number" ? { responseTime: entry.responseTime } : {}),
+          ...(typeof entry.size === "number" ? { size: entry.size } : {}),
+          timestamp: entry.timestamp || new Date().toISOString(),
+          ...(entry.requestBody ? { requestBody: entry.requestBody } : {}),
+        }));
+
+      if (shouldClear) {
+        await readNetworkBuffer(tabId, true);
+      }
+
+      return JSON.stringify({
+        success: true,
+        action: "read_network_requests",
+        tabId,
+        requestsCount: filtered.length,
+        ...(pattern ? { pattern } : {}),
+        ...(shouldClear ? { requestsCleared: true } : {}),
+        ...(limit !== undefined ? { limitApplied: appliedLimit } : {}),
+        requests: filtered,
+      });
+    } catch (error) {
+      return fail(String(error), pattern ? { urlPattern: pattern } : {});
+    }
+  },
+  {
+    name: "read_network_requests",
+    description:
+      "Read captured network requests for a tab, with optional urlPattern filtering, limit, and clear behavior.",
+    schema: z.object({
+      tabId: z.number().int().describe("Tab ID to read network requests from."),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Maximum number of requests to return. Default 100."),
+      clear: z
+        .boolean()
+        .optional()
+        .describe("If true, clear captured requests after reading. Default false."),
+      urlPattern: z
+        .string()
+        .optional()
+        .describe("Optional URL substring filter (e.g., '/api/' or 'example.com')."),
+    }),
+  }
+);
+
 const turnAnswerStartTool = tool(
   async () => {
     return JSON.stringify({
@@ -3587,6 +3947,7 @@ const tools = [
   uploadImageTool,
   fileUploadTool,
   readConsoleMessagesTool,
+  readNetworkRequestsTool,
   navigateTool,
   resizeWindowTool,
   getPageTextTool,
@@ -3841,6 +4202,29 @@ function parseDirectCommand(input: string): ToolCall | null {
     }
   }
 
+  if (trimmed.startsWith("/read_network_requests")) {
+    const raw = trimmed.replace(/^\/read_network_requests\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    if (Number.isInteger(parsedTabId)) {
+      const clearFlag = parts.includes("clear=true");
+      const limitPart = parts.find((part) => part.startsWith("limit="));
+      const parsedLimit = limitPart ? Number.parseInt(limitPart.replace(/^limit=/, ""), 10) : undefined;
+      const patternPart = parts.find((part) => part.startsWith("urlPattern="));
+      const parsedUrlPattern = patternPart ? patternPart.replace(/^urlPattern=/, "") : undefined;
+
+      return {
+        name: readNetworkRequestsTool.name,
+        args: {
+          tabId: parsedTabId,
+          ...(clearFlag ? { clear: true } : {}),
+          ...(Number.isInteger(parsedLimit) ? { limit: parsedLimit } : {}),
+          ...(parsedUrlPattern ? { urlPattern: parsedUrlPattern } : {}),
+        },
+      };
+    }
+  }
+
   return null;
 }
 
@@ -3908,6 +4292,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call upload_image with imageId and tabId plus exactly one of ref/coordinate to upload screenshots or images to file inputs or drag-drop targets. " +
         "Call file_upload with tabId, ref, and absolute local file paths to upload files directly to file input elements. " +
         "Call read_console_messages with tabId and pattern to inspect browser console logs; optionally use clear, limit, and onlyErrors. " +
+        "Call read_network_requests with tabId to inspect network activity; optionally use urlPattern, limit, and clear. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +

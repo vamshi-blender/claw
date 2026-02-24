@@ -110,6 +110,17 @@
   <p id="dropOutput">No image dropped</p>
 </section>
 
+<section id="network-tests">
+  <h2>Network Request Tests</h2>
+  <button id="netSuccessBtn">GET (200 OK)</button>
+  <button id="net404Btn">GET (404 Not Found)</button>
+  <button id="net500Btn">GET (500 Server Error)</button>
+  <button id="netCorsBtn">GET (CORS Fail)</button>
+  <button id="netPostBtn">POST (200 OK)</button>
+  <button id="netTimeoutBtn">GET (Timeout)</button>
+  <p id="networkOutput">Status: (none)</p>
+</section>
+
 <section id="scroll-tests">
   <h2>Scroll Test</h2>
   <div class="spacer"></div>
@@ -205,6 +216,67 @@
     } else {
       dropOutput.textContent = 'Please drop an image file.';
     }
+  });
+
+  // Network request tests
+  const networkOutput = document.getElementById('networkOutput');
+
+  function updateNetStatus(label, response) {
+    networkOutput.textContent = 'Status: ' + label + ' — ' + response;
+  }
+
+  // 200 OK - successful GET
+  document.getElementById('netSuccessBtn').addEventListener('click', () => {
+    networkOutput.textContent = 'Status: Fetching...';
+    fetch('https://httpbin.org/get')
+      .then(r => updateNetStatus('GET /get', r.status + ' ' + r.statusText))
+      .catch(e => updateNetStatus('GET /get', 'Error: ' + e.message));
+  });
+
+  // 404 Not Found
+  document.getElementById('net404Btn').addEventListener('click', () => {
+    networkOutput.textContent = 'Status: Fetching...';
+    fetch('https://httpbin.org/status/404')
+      .then(r => updateNetStatus('GET /status/404', r.status + ' ' + r.statusText))
+      .catch(e => updateNetStatus('GET /status/404', 'Error: ' + e.message));
+  });
+
+  // 500 Server Error
+  document.getElementById('net500Btn').addEventListener('click', () => {
+    networkOutput.textContent = 'Status: Fetching...';
+    fetch('https://httpbin.org/status/500')
+      .then(r => updateNetStatus('GET /status/500', r.status + ' ' + r.statusText))
+      .catch(e => updateNetStatus('GET /status/500', 'Error: ' + e.message));
+  });
+
+  // CORS failure - request to a non-CORS endpoint
+  document.getElementById('netCorsBtn').addEventListener('click', () => {
+    networkOutput.textContent = 'Status: Fetching...';
+    fetch('https://www.google.com/', { mode: 'cors' })
+      .then(r => updateNetStatus('GET google.com (CORS)', r.status + ' ' + r.statusText))
+      .catch(e => updateNetStatus('GET google.com (CORS)', 'Error: ' + e.message));
+  });
+
+  // POST request - successful
+  document.getElementById('netPostBtn').addEventListener('click', () => {
+    networkOutput.textContent = 'Status: Fetching...';
+    fetch('https://httpbin.org/post', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ test: true, message: 'hello' })
+    })
+      .then(r => updateNetStatus('POST /post', r.status + ' ' + r.statusText))
+      .catch(e => updateNetStatus('POST /post', 'Error: ' + e.message));
+  });
+
+  // Timeout - delayed response with AbortController
+  document.getElementById('netTimeoutBtn').addEventListener('click', () => {
+    networkOutput.textContent = 'Status: Fetching (will timeout in 2s)...';
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 2000);
+    fetch('https://httpbin.org/delay/10', { signal: controller.signal })
+      .then(r => updateNetStatus('GET /delay/10', r.status + ' ' + r.statusText))
+      .catch(e => updateNetStatus('GET /delay/10 (Timeout)', 'Error: ' + e.message));
   });
 
   // Hover visual feedback (already CSS)
