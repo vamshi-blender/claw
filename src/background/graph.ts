@@ -1074,6 +1074,170 @@ async function getElementMetadataByRef(tabId: number, ref: string) {
   );
 }
 
+type ConsoleCapturedMessage = {
+  type: string;
+  message: string;
+  timestamp: string;
+  source?: string;
+  url?: string;
+};
+
+async function ensureConsoleMonitor(tabId: number) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: () => {
+      type ClawConsoleStore = {
+        installed: boolean;
+        entries: Array<{
+          type: string;
+          message: string;
+          timestamp: string;
+          source?: string;
+          url?: string;
+        }>;
+        maxEntries: number;
+      };
+
+      const globalObj = window as unknown as {
+        __clawConsoleStore?: ClawConsoleStore;
+      };
+      if (globalObj.__clawConsoleStore?.installed) {
+        return;
+      }
+
+      const store: ClawConsoleStore = globalObj.__clawConsoleStore ?? {
+        installed: false,
+        entries: [],
+        maxEntries: 2000,
+      };
+      globalObj.__clawConsoleStore = store;
+
+      const pushEntry = (entry: { type: string; message: string; source?: string; url?: string }) => {
+        store.entries.push({
+          ...entry,
+          timestamp: new Date().toISOString(),
+        });
+        if (store.entries.length > store.maxEntries) {
+          store.entries.splice(0, store.entries.length - store.maxEntries);
+        }
+      };
+
+      const safeArgToString = (value: unknown): string => {
+        if (typeof value === "string") {
+          return value;
+        }
+        if (value instanceof Error) {
+          return value.stack || value.message || String(value);
+        }
+        if (value === undefined) {
+          return "undefined";
+        }
+        try {
+          return JSON.stringify(value);
+        } catch {
+          return String(value);
+        }
+      };
+
+      const inferSourceFromStack = (stack?: string) => {
+        if (!stack) {
+          return undefined;
+        }
+        const lines = stack.split("\n").map((line) => line.trim()).filter(Boolean);
+        const candidate = lines.find((line) => /:\d+:\d+/.test(line));
+        if (!candidate) {
+          return undefined;
+        }
+        return candidate.replace(/^at\s+/, "");
+      };
+
+      const methods: Array<"log" | "info" | "warn" | "error" | "debug"> = [
+        "log",
+        "info",
+        "warn",
+        "error",
+        "debug",
+      ];
+      for (const method of methods) {
+        const original = console[method].bind(console);
+        console[method] = (...args: unknown[]) => {
+          const errorStack = new Error().stack;
+          const message = args.map((arg) => safeArgToString(arg)).join(" ");
+          pushEntry({
+            type: method === "warn" ? "warning" : method,
+            message,
+            source: inferSourceFromStack(errorStack),
+            url: window.location.href,
+          });
+          original(...args);
+        };
+      }
+
+      window.addEventListener("error", (event) => {
+        const message = event.message || "Unhandled error";
+        const source = event.filename
+          ? `${event.filename}:${event.lineno || 0}${event.colno ? `:${event.colno}` : ""}`
+          : undefined;
+        pushEntry({
+          type: "error",
+          message,
+          source,
+          url: window.location.href,
+        });
+      });
+
+      window.addEventListener("unhandledrejection", (event) => {
+        const reason = event.reason;
+        const message =
+          typeof reason === "string"
+            ? reason
+            : reason instanceof Error
+            ? reason.stack || reason.message
+            : safeArgToString(reason);
+        pushEntry({
+          type: "exception",
+          message,
+          source: inferSourceFromStack(reason instanceof Error ? reason.stack : undefined),
+          url: window.location.href,
+        });
+      });
+
+      store.installed = true;
+    },
+  });
+}
+
+async function readConsoleBuffer(tabId: number, clear: boolean) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    args: [clear],
+    func: (clearEntries: boolean) => {
+      const globalObj = window as unknown as {
+        __clawConsoleStore?: {
+          entries: Array<{
+            type: string;
+            message: string;
+            timestamp: string;
+            source?: string;
+            url?: string;
+          }>;
+        };
+      };
+      const entries = Array.isArray(globalObj.__clawConsoleStore?.entries)
+        ? [...globalObj.__clawConsoleStore!.entries]
+        : [];
+      if (clearEntries && globalObj.__clawConsoleStore) {
+        globalObj.__clawConsoleStore.entries = [];
+      }
+      return entries;
+    },
+  });
+
+  return (injection?.result as ConsoleCapturedMessage[] | undefined) ?? [];
+}
+
 async function readUploadedFilesFromInput(tabId: number, ref: string) {
   const [injection] = await chrome.scripting.executeScript({
     target: { tabId },
@@ -1288,6 +1452,12 @@ const tabsContextTool = tool(
 
     if (domainSkills.length > 0) {
       response.domainSkills = domainSkills;
+    }
+
+    try {
+      await ensureConsoleMonitor(initialTab.id);
+    } catch {
+      // Best effort only.
     }
 
     return JSON.stringify(response);
@@ -2045,6 +2215,12 @@ const formInputTool = tool(
     }
 
     try {
+      try {
+        await ensureConsoleMonitor(tabId);
+      } catch {
+        // Best effort only; form input should still work if monitor installation fails.
+      }
+
       const [injection] = await chrome.scripting.executeScript({
         target: { tabId },
         args: [ref, value],
@@ -3173,6 +3349,128 @@ const uploadImageTool = tool(
   }
 );
 
+const readConsoleMessagesTool = tool(
+  async ({ tabId, pattern, clear, limit, onlyErrors }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        success: false,
+        action: "read_console_messages",
+        tabId,
+        error: scope.error,
+      });
+    }
+
+    const fail = (message: string, extras: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        success: false,
+        action: "read_console_messages",
+        tabId,
+        ...extras,
+        error: message,
+      });
+
+    let compiledPattern: RegExp;
+    try {
+      compiledPattern = new RegExp(pattern, "i");
+    } catch (error) {
+      return fail(`Invalid regex pattern: ${String(error)}`, { pattern });
+    }
+
+    const appliedLimit = typeof limit === "number" ? Math.max(1, Math.floor(limit)) : 100;
+    const shouldClear = Boolean(clear);
+    const errorsOnly = Boolean(onlyErrors);
+
+    try {
+      await ensureConsoleMonitor(tabId);
+
+      const currentDomain = parseHostname(scope.targetTab.url) ?? null;
+      const filterEntries = (entries: ConsoleCapturedMessage[]) =>
+        entries
+          .filter((entry) => {
+            if (!entry || typeof entry.message !== "string") {
+              return false;
+            }
+            const entryDomain = parseHostname(entry.url);
+            if (currentDomain && entryDomain && entryDomain !== currentDomain) {
+              return false;
+            }
+            if (errorsOnly && !(entry.type === "error" || entry.type === "exception")) {
+              return false;
+            }
+            const searchable = [
+              entry.type ?? "",
+              entry.source ?? "",
+              entry.url ?? "",
+              entry.message ?? "",
+            ].join(" ");
+            return compiledPattern.test(searchable);
+          })
+          .slice(-appliedLimit)
+          .map((entry) => ({
+            type: entry.type || "log",
+            message: entry.message,
+            timestamp: entry.timestamp || new Date().toISOString(),
+            ...(entry.source ? { source: entry.source } : {}),
+          }));
+
+      let rawEntries = await readConsoleBuffer(tabId, false);
+      let filtered = filterEntries(rawEntries);
+
+      // Handles turns where an action tool and read_console_messages are invoked in parallel.
+      if (filtered.length === 0) {
+        await sleep(250);
+        rawEntries = await readConsoleBuffer(tabId, false);
+        filtered = filterEntries(rawEntries);
+      }
+
+      if (shouldClear) {
+        await readConsoleBuffer(tabId, true);
+      }
+
+      return JSON.stringify({
+        success: true,
+        action: "read_console_messages",
+        tabId,
+        messagesCount: filtered.length,
+        ...(shouldClear ? { messagesCleared: true } : {}),
+        ...(limit !== undefined ? { limitApplied: appliedLimit } : {}),
+        messages: filtered,
+      });
+    } catch (error) {
+      return fail(String(error), { pattern });
+    }
+  },
+  {
+    name: "read_console_messages",
+    description:
+      "Read browser console messages from a tab filtered by regex pattern. Supports clear, limit, and onlyErrors options.",
+    schema: z.object({
+      tabId: z.number().int().describe("Tab ID to read console messages from."),
+      pattern: z
+        .string()
+        .min(1)
+        .describe(
+          "Regex pattern to filter console messages, e.g. 'error|warning' or 'MyApp'."
+        ),
+      clear: z
+        .boolean()
+        .optional()
+        .describe("If true, clear captured console messages after reading. Default false."),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Maximum messages to return. Default 100."),
+      onlyErrors: z
+        .boolean()
+        .optional()
+        .describe("If true, return only error and exception messages. Default false."),
+    }),
+  }
+);
+
 const turnAnswerStartTool = tool(
   async () => {
     return JSON.stringify({
@@ -3288,6 +3586,7 @@ const tools = [
   computerTool,
   uploadImageTool,
   fileUploadTool,
+  readConsoleMessagesTool,
   navigateTool,
   resizeWindowTool,
   getPageTextTool,
@@ -3518,6 +3817,30 @@ function parseDirectCommand(input: string): ToolCall | null {
     }
   }
 
+  if (trimmed.startsWith("/read_console_messages")) {
+    const raw = trimmed.replace(/^\/read_console_messages\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    const patternText = parts[1];
+    if (Number.isInteger(parsedTabId) && patternText) {
+      const clearFlag = parts.includes("clear=true");
+      const onlyErrorsFlag = parts.includes("onlyErrors=true");
+      const limitPart = parts.find((part) => part.startsWith("limit="));
+      const parsedLimit = limitPart ? Number.parseInt(limitPart.replace(/^limit=/, ""), 10) : undefined;
+
+      return {
+        name: readConsoleMessagesTool.name,
+        args: {
+          tabId: parsedTabId,
+          pattern: patternText,
+          ...(clearFlag ? { clear: true } : {}),
+          ...(onlyErrorsFlag ? { onlyErrors: true } : {}),
+          ...(Number.isInteger(parsedLimit) ? { limit: parsedLimit } : {}),
+        },
+      };
+    }
+  }
+
   return null;
 }
 
@@ -3584,6 +3907,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call computer with action and tabId for mouse/keyboard interactions, scrolling, waiting, drag, hover, screenshots, and zoom. " +
         "Call upload_image with imageId and tabId plus exactly one of ref/coordinate to upload screenshots or images to file inputs or drag-drop targets. " +
         "Call file_upload with tabId, ref, and absolute local file paths to upload files directly to file input elements. " +
+        "Call read_console_messages with tabId and pattern to inspect browser console logs; optionally use clear, limit, and onlyErrors. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +

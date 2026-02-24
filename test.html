@@ -143,7 +143,12 @@
   // Typing test
   const input = document.getElementById('textInput');
   const typedOutput = document.getElementById('typedOutput');
-  input.addEventListener('input', () => typedOutput.textContent = 'You typed: ' + input.value);
+  input.addEventListener('input', () => {
+    typedOutput.textContent = 'You typed: ' + input.value;
+    console.log('Typing input changed: ' + input.value);
+    console.warn('Warning: user is typing in the input field');
+    console.error('Error: simulated error for typing event');
+  });
 
   // Drag-and-drop
   const draggable = document.getElementById('draggable');
