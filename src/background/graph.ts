@@ -1178,6 +1178,23 @@ async function readUploadedFilesFromInput(tabId: number, ref: string) {
   );
 }
 
+function getMimeTypeFromDataUrl(dataUrl: string) {
+  const match = dataUrl.match(/^data:([^;,]+)[;,]/i);
+  return match?.[1]?.toLowerCase() ?? "application/octet-stream";
+}
+
+function ensureImageFilename(input: string | undefined, mimeType: string) {
+  const fallbackExt = mimeType === "image/jpeg" ? ".jpg" : mimeType === "image/webp" ? ".webp" : ".png";
+  const trimmed = (input ?? "").trim();
+  if (!trimmed) {
+    return `image${fallbackExt}`;
+  }
+  if (/\.[a-zA-Z0-9]+$/.test(trimmed)) {
+    return trimmed;
+  }
+  return `${trimmed}${fallbackExt}`;
+}
+
 async function dataUrlToBlob(dataUrl: string) {
   const response = await fetch(dataUrl);
   return response.blob();
@@ -2871,6 +2888,291 @@ const fileUploadTool = tool(
   }
 );
 
+const uploadImageTool = tool(
+  async ({ imageId, tabId, ref, coordinate, filename }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        success: false,
+        action: "upload_image",
+        imageId,
+        tabId,
+        error: scope.error,
+      });
+    }
+
+    return withTabActionLock(tabId, async () => {
+      const fail = (message: string, extras: Record<string, unknown> = {}) =>
+        JSON.stringify({
+          success: false,
+          action: "upload_image",
+          imageId,
+          tabId,
+          ...extras,
+          error: message,
+        });
+
+      const hasRef = typeof ref === "string" && ref.trim().length > 0;
+      const hasCoordinate = Array.isArray(coordinate) && coordinate.length === 2;
+      if (hasRef === hasCoordinate) {
+        return fail("Provide exactly one of 'ref' or 'coordinate' (not both).");
+      }
+
+      const storedImage = screenshotStore.get(imageId);
+      if (!storedImage) {
+        return fail(
+          `Image '${imageId}' not found. Provide an imageId from computer screenshot/zoom, or a supported uploaded image id.`
+        );
+      }
+
+      const mimeType = getMimeTypeFromDataUrl(storedImage.dataUrl);
+      if (!mimeType.startsWith("image/")) {
+        return fail(`Image '${imageId}' is not an image MIME type: ${mimeType}`);
+      }
+
+      const uploadFilename = ensureImageFilename(filename, mimeType);
+      let uploadedFileSize = 0;
+      try {
+        const blob = await dataUrlToBlob(storedImage.dataUrl);
+        uploadedFileSize = blob.size;
+      } catch {
+        uploadedFileSize = 0;
+      }
+
+      if (hasRef) {
+        const targetRef = ref!.trim();
+        const [injection] = await chrome.scripting.executeScript({
+          target: { tabId },
+          args: [targetRef, storedImage.dataUrl, uploadFilename, mimeType],
+          func: async (targetRefArg: string, dataUrl: string, finalName: string, contentType: string) => {
+            const refHash = (input: string) => {
+              let hash = 0;
+              for (let i = 0; i < input.length; i += 1) {
+                hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+              }
+              return Math.abs(hash).toString(36);
+            };
+
+            const getRef = (path: string) => `ref_${refHash(path)}`;
+            const root = document.documentElement || document.body;
+            if (!root) {
+              return { success: false, error: "No document root found." };
+            }
+
+            const findByRef = (el: Element, path: string): Element | null => {
+              if (getRef(path) === targetRefArg) {
+                return el;
+              }
+              const children = Array.from(el.children);
+              for (let i = 0; i < children.length; i += 1) {
+                const child = children[i];
+                const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+                const found = findByRef(child, childPath);
+                if (found) {
+                  return found;
+                }
+              }
+              return null;
+            };
+
+            const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+            if (!target) {
+              return {
+                success: false,
+                error: "Element reference not found. Use read_page/find again to refresh refs.",
+              };
+            }
+
+            const response = await fetch(dataUrl);
+            const blob = await response.blob();
+            const file = new File([blob], finalName, {
+              type: contentType || blob.type || "application/octet-stream",
+            });
+
+            const targetSummaryBase = {
+              ref: targetRefArg,
+              type: target.tagName.toLowerCase(),
+            };
+
+            if (target instanceof HTMLInputElement && target.type.toLowerCase() === "file") {
+              const transfer = new DataTransfer();
+              transfer.items.add(file);
+              target.files = transfer.files;
+              target.dispatchEvent(new Event("input", { bubbles: true }));
+              target.dispatchEvent(new Event("change", { bubbles: true }));
+              return {
+                success: true,
+                method: "file_input",
+                targetElement: {
+                  ...targetSummaryBase,
+                  type: "input",
+                  inputType: "file",
+                  ...(target.multiple ? { multiple: true } : {}),
+                  ...(target.accept ? { accept: target.accept } : {}),
+                },
+                uploadedFile: {
+                  name: file.name,
+                  size: file.size,
+                  mimeType: file.type,
+                },
+              };
+            }
+
+            const transfer = new DataTransfer();
+            transfer.items.add(file);
+            const dragEnter = new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer });
+            const dragOver = new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer });
+            const drop = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer });
+            target.dispatchEvent(dragEnter);
+            target.dispatchEvent(dragOver);
+            target.dispatchEvent(drop);
+
+            return {
+              success: true,
+              method: "drag_and_drop",
+              targetElement: targetSummaryBase,
+              uploadedFile: {
+                name: file.name,
+                size: file.size,
+                mimeType: file.type,
+              },
+            };
+          },
+        });
+
+        const result = (injection?.result as
+          | {
+              success: true;
+              method: "file_input" | "drag_and_drop";
+              targetElement: {
+                ref: string;
+                type: string;
+                inputType?: string;
+                multiple?: boolean;
+                accept?: string;
+              };
+              uploadedFile: { name: string; size: number; mimeType: string };
+            }
+          | { success: false; error: string }
+          | undefined) ?? { success: false as const, error: "Failed to upload image by ref." };
+
+        if (!result.success) {
+          return fail(result.error, { ref: targetRef });
+        }
+
+        return JSON.stringify({
+          success: true,
+          action: "upload_image",
+          imageId,
+          tabId,
+          ...(result.method === "drag_and_drop" ? { method: "drag_and_drop" } : {}),
+          targetElement: result.targetElement,
+          uploadedFile: {
+            name: result.uploadedFile.name,
+            size: result.uploadedFile.size || uploadedFileSize,
+            mimeType: result.uploadedFile.mimeType || mimeType,
+          },
+        });
+      }
+
+      const point = normalizePoint([coordinate![0], coordinate![1]]);
+      const [injection] = await chrome.scripting.executeScript({
+        target: { tabId },
+        args: [point[0], point[1], storedImage.dataUrl, uploadFilename, mimeType],
+        func: async (x: number, y: number, dataUrl: string, finalName: string, contentType: string) => {
+          const target = document.elementFromPoint(x, y) || document.body;
+          if (!target) {
+            return { success: false, error: "No drop target found at coordinate." };
+          }
+
+          const response = await fetch(dataUrl);
+          const blob = await response.blob();
+          const file = new File([blob], finalName, {
+            type: contentType || blob.type || "application/octet-stream",
+          });
+
+          const transfer = new DataTransfer();
+          transfer.items.add(file);
+          const dragEnter = new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer });
+          const dragOver = new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer });
+          const drop = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer });
+          target.dispatchEvent(dragEnter);
+          target.dispatchEvent(dragOver);
+          target.dispatchEvent(drop);
+
+          return {
+            success: true,
+            method: "drag_and_drop",
+            dropTarget: {
+              coordinate: [x, y],
+              element: target === document.body ? "document area" : target.tagName.toLowerCase(),
+            },
+            uploadedFile: {
+              name: file.name,
+              size: file.size,
+              mimeType: file.type,
+            },
+          };
+        },
+      });
+
+      const result = (injection?.result as
+        | {
+            success: true;
+            method: "drag_and_drop";
+            dropTarget: { coordinate: [number, number]; element: string };
+            uploadedFile: { name: string; size: number; mimeType: string };
+          }
+        | { success: false; error: string }
+        | undefined) ?? { success: false as const, error: "Failed to upload image by coordinate." };
+
+      if (!result.success) {
+        return fail(result.error, { coordinate: point });
+      }
+
+      return JSON.stringify({
+        success: true,
+        action: "upload_image",
+        method: "drag_and_drop",
+        imageId,
+        tabId,
+        dropTarget: result.dropTarget,
+        uploadedFile: {
+          name: result.uploadedFile.name,
+          size: result.uploadedFile.size || uploadedFileSize,
+          mimeType: result.uploadedFile.mimeType || mimeType,
+        },
+      });
+    });
+  },
+  {
+    name: "upload_image",
+    description:
+      "Upload a stored image (from computer screenshot/zoom) to a target element via ref or coordinate drag-drop. Requires imageId and tabId, plus exactly one of ref or coordinate.",
+    schema: z.object({
+      imageId: z
+        .string()
+        .min(1)
+        .describe("Image ID from computer screenshot/zoom or supported uploaded image IDs."),
+      tabId: z.number().int().describe("Tab ID where the upload target is located."),
+      ref: z
+        .string()
+        .optional()
+        .describe(
+          "Element reference ID from read_page/find. Use for file inputs or specific elements. Provide either ref or coordinate."
+        ),
+      coordinate: z
+        .array(z.number())
+        .length(2)
+        .optional()
+        .describe(
+          "Viewport coordinate [x, y] for drag-and-drop targets. Provide either coordinate or ref."
+        ),
+      filename: z.string().optional().describe("Optional uploaded filename. Defaults to image.png."),
+    }),
+  }
+);
+
 const turnAnswerStartTool = tool(
   async () => {
     return JSON.stringify({
@@ -2984,6 +3286,7 @@ const tools = [
   findTool,
   formInputTool,
   computerTool,
+  uploadImageTool,
   fileUploadTool,
   navigateTool,
   resizeWindowTool,
@@ -3175,6 +3478,46 @@ function parseDirectCommand(input: string): ToolCall | null {
     }
   }
 
+  if (trimmed.startsWith("/upload_image")) {
+    const raw = trimmed.replace(/^\/upload_image\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    const imageId = parts[1];
+    const modeArg = parts[2];
+    if (Number.isInteger(parsedTabId) && imageId && modeArg) {
+      if (modeArg.startsWith("ref:")) {
+        const parsedRef = modeArg.slice(4).trim();
+        if (parsedRef) {
+          const parsedFilename = parts[3];
+          return {
+            name: uploadImageTool.name,
+            args: {
+              tabId: parsedTabId,
+              imageId,
+              ref: parsedRef,
+              ...(parsedFilename ? { filename: parsedFilename } : {}),
+            },
+          };
+        }
+      }
+      if (modeArg.startsWith("coord:")) {
+        const tuple = modeArg.slice(6).split(",").map((x) => Number.parseFloat(x));
+        if (tuple.length === 2 && Number.isFinite(tuple[0]) && Number.isFinite(tuple[1])) {
+          const parsedFilename = parts[3];
+          return {
+            name: uploadImageTool.name,
+            args: {
+              tabId: parsedTabId,
+              imageId,
+              coordinate: [tuple[0], tuple[1]],
+              ...(parsedFilename ? { filename: parsedFilename } : {}),
+            },
+          };
+        }
+      }
+    }
+  }
+
   return null;
 }
 
@@ -3239,6 +3582,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call find with tabId and a natural language query to locate matching elements quickly. " +
         "Call form_input with tabId, ref, and value to set form fields (including inputs, selects, and textareas). " +
         "Call computer with action and tabId for mouse/keyboard interactions, scrolling, waiting, drag, hover, screenshots, and zoom. " +
+        "Call upload_image with imageId and tabId plus exactly one of ref/coordinate to upload screenshots or images to file inputs or drag-drop targets. " +
         "Call file_upload with tabId, ref, and absolute local file paths to upload files directly to file input elements. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +

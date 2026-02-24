@@ -39,6 +39,29 @@
     left: 25px;
     cursor: grab;
   }
+  .drop-zone {
+    width: 300px;
+    height: 200px;
+    border: 2px dashed #aaa;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #888;
+    font-size: 14px;
+    transition: background 0.2s, border-color 0.2s;
+    overflow: hidden;
+  }
+  .drop-zone.dragover {
+    background: #e8f5e9;
+    border-color: #4caf50;
+    color: #4caf50;
+  }
+  .drop-zone img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+  }
   .spacer {
     height: 800px; /* for scroll testing */
   }
@@ -79,6 +102,12 @@
   <h2>File Select Test</h2>
   <input type="file" id="fileInput" />
   <p id="fileOutput">No file selected</p>
+</section>
+
+<section id="image-drop-tests">
+  <h2>Image Drag & Drop Test</h2>
+  <div class="drop-zone" id="dropZone">Drag & drop an image here</div>
+  <p id="dropOutput">No image dropped</p>
 </section>
 
 <section id="scroll-tests">
@@ -140,6 +169,36 @@
       fileOutput.textContent = 'Selected: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
     } else {
       fileOutput.textContent = 'No file selected';
+    }
+  });
+
+  // Image drag & drop
+  const dropZone = document.getElementById('dropZone');
+  const dropOutput = document.getElementById('dropOutput');
+
+  dropZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropZone.classList.add('dragover');
+  });
+  dropZone.addEventListener('dragleave', () => {
+    dropZone.classList.remove('dragover');
+  });
+  dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    if (file && file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        dropZone.innerHTML = '';
+        const img = document.createElement('img');
+        img.src = ev.target.result;
+        dropZone.appendChild(img);
+      };
+      reader.readAsDataURL(file);
+      dropOutput.textContent = 'Dropped: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+    } else {
+      dropOutput.textContent = 'Please drop an image file.';
     }
   });
 
