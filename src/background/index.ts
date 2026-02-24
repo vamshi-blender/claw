@@ -35,11 +35,21 @@ async function loadLlmSettings(): Promise<LlmSettings | undefined> {
   return settings;
 }
 
+async function ensureClawTabGroup(tab: chrome.tabs.Tab) {
+  if (!tab.id || (typeof tab.groupId === "number" && tab.groupId >= 0)) {
+    return;
+  }
+
+  const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+  await chrome.tabGroups.update(groupId, { title: "🔥Claw", color: "yellow" });
+}
+
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.id) {
     return;
   }
-  await chrome.sidePanel.open({ tabId: tab.id });
+
+  await Promise.allSettled([chrome.sidePanel.open({ tabId: tab.id }), ensureClawTabGroup(tab)]);
 });
 
 chrome.runtime.onMessage.addListener((message: RunGraphRequest, _sender, sendResponse) => {
