@@ -132,6 +132,16 @@ function normalizeNavigateUrl(input: string) {
   return { kind: "url" as const, url: `https://${trimmed}` };
 }
 
+function classifyDeviceType(width: number) {
+  if (width <= 480) {
+    return "mobile";
+  }
+  if (width <= 1024) {
+    return "tablet";
+  }
+  return "desktop";
+}
+
 const tabsContextTool = tool(
   async () => {
     const [initialTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -286,6 +296,77 @@ const navigateTool = tool(
   }
 );
 
+const resizeWindowTool = tool(
+  async ({ width, height, tabId }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        success: false,
+        action: "resize_window",
+        tabId,
+        error: scope.error,
+      });
+    }
+
+    const windowId = scope.targetTab.windowId;
+    if (windowId === undefined) {
+      return JSON.stringify({
+        success: false,
+        action: "resize_window",
+        tabId,
+        error: "No browser window found for target tab.",
+      });
+    }
+
+    try {
+      const previous = await chrome.windows.get(windowId);
+      const updated = await chrome.windows.update(windowId, {
+        width,
+        height,
+        state: "normal",
+      });
+
+      const finalWidth = updated.width ?? width;
+      const finalHeight = updated.height ?? height;
+      const deviceType = classifyDeviceType(finalWidth);
+      const orientation = finalWidth >= finalHeight ? "landscape" : "portrait";
+
+      return JSON.stringify({
+        success: true,
+        action: "resize_window",
+        tabId,
+        previousDimensions: {
+          width: previous.width ?? null,
+          height: previous.height ?? null,
+        },
+        newDimensions: {
+          width: finalWidth,
+          height: finalHeight,
+        },
+        deviceType,
+        orientation,
+      });
+    } catch (error) {
+      return JSON.stringify({
+        success: false,
+        action: "resize_window",
+        tabId,
+        error: String(error),
+      });
+    }
+  },
+  {
+    name: "resize_window",
+    description:
+      "Resize the browser window for a specific tab. Requires width, height, and tabId from tabs_context.",
+    schema: z.object({
+      width: z.number().int().positive().describe("Target window width in pixels."),
+      height: z.number().int().positive().describe("Target window height in pixels."),
+      tabId: z.number().int().describe("Tab ID used to identify which window to resize."),
+    }),
+  }
+);
+
 const turnAnswerStartTool = tool(
   async () => {
     return JSON.stringify({
@@ -392,7 +473,7 @@ const javascriptTool = tool(
   }
 );
 
-const tools = [tabsContextTool, tabsCreateTool, navigateTool, javascriptTool, turnAnswerStartTool];
+const tools = [tabsContextTool, tabsCreateTool, navigateTool, resizeWindowTool, javascriptTool, turnAnswerStartTool];
 const toolNode = new ToolNode(tools);
 const checkpointer = new MemorySaver();
 let fallbackSettings: LlmSettings | undefined;
@@ -467,6 +548,24 @@ function parseDirectCommand(input: string): ToolCall | null {
       return {
         name: navigateTool.name,
         args: { tabId: parsedTabId, url: target },
+      };
+    }
+  }
+
+  if (trimmed.startsWith("/resize")) {
+    const raw = trimmed.replace(/^\/resize\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    const parsedWidth = Number.parseInt(parts[1] ?? "", 10);
+    const parsedHeight = Number.parseInt(parts[2] ?? "", 10);
+    if (Number.isInteger(parsedTabId) && Number.isInteger(parsedWidth) && Number.isInteger(parsedHeight)) {
+      return {
+        name: resizeWindowTool.name,
+        args: {
+          tabId: parsedTabId,
+          width: parsedWidth,
+          height: parsedHeight,
+        },
       };
     }
   }
@@ -549,6 +648,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call tabs_context first when you need a valid tabId or when the user asks about available tabs. " +
         "Call tabs_create to create a new tab in the current tab group/context. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
+        "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call javascript_tool with action='javascript_exec', text, and tabId when user asks to run JavaScript on a page. " +
         "Call turn_answer_start immediately before your final user-facing response in every turn. " +
         "For page location use window.location.href. Prefer scripts that return a value."
