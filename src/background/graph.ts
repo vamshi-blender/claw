@@ -697,6 +697,227 @@ const readPageTool = tool(
   }
 );
 
+const findTool = tool(
+  async ({ query, tabId }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        results: [],
+        count: 0,
+        error: scope.error,
+      });
+    }
+
+    const debuggee: chrome.debugger.Debuggee = { tabId };
+    try {
+      await chrome.debugger.attach(debuggee, "1.3");
+      await chrome.debugger.sendCommand(debuggee, "Runtime.enable");
+
+      const extractionScript = `(() => {
+        const query = ${JSON.stringify(query)}.toLowerCase().trim();
+        const queryTokens = query.split(/\\s+/).filter(Boolean);
+
+        const refHash = (input) => {
+          let hash = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+          }
+          return Math.abs(hash).toString(36);
+        };
+
+        const getType = (el) => {
+          const role = (el.getAttribute("role") || "").toLowerCase();
+          if (role) return role;
+          const tag = el.tagName.toLowerCase();
+          if (tag === "input") {
+            const t = (el.getAttribute("type") || "text").toLowerCase();
+            if (t === "search") return "searchbox";
+            if (t === "checkbox") return "checkbox";
+            if (t === "radio") return "radio";
+            return "textbox";
+          }
+          if (tag === "textarea") return "textbox";
+          if (tag === "a") return "link";
+          return tag;
+        };
+
+        const getName = (el) => {
+          const aria = (el.getAttribute("aria-label") || "").trim();
+          if (aria) return aria;
+          const title = (el.getAttribute("title") || "").trim();
+          if (title) return title;
+          if (el instanceof HTMLInputElement && el.labels && el.labels.length > 0) {
+            const fromLabels = Array.from(el.labels).map((l) => (l.textContent || "").trim()).filter(Boolean).join(" ");
+            if (fromLabels) return fromLabels;
+          }
+          const txt = (el.textContent || "").replace(/\\s+/g, " ").trim();
+          if (txt) return txt.slice(0, 120);
+          return "";
+        };
+
+        const isVisible = (el) => {
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+            return false;
+          }
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+
+        const scoreElement = (el, type, name, text, placeholder, inputType) => {
+          const haystack = [type, name, text, placeholder, inputType].join(" ").toLowerCase();
+          if (!haystack.trim()) return 0;
+
+          let score = 0;
+          if (query && haystack.includes(query)) {
+            score += 12;
+          }
+          for (const token of queryTokens) {
+            if (haystack.includes(token)) {
+              score += 2;
+            }
+          }
+
+          if (query.includes("button") && type === "button") score += 4;
+          if (query.includes("link") && type === "link") score += 4;
+          if (query.includes("search") && (type === "searchbox" || placeholder.toLowerCase().includes("search"))) score += 5;
+          if (query.includes("input") && (type === "textbox" || type === "searchbox")) score += 4;
+          if (query.includes("checkbox") && type === "checkbox") score += 5;
+
+          return score;
+        };
+
+        const root = document.documentElement || document.body;
+        if (!root) return { results: [], count: 0 };
+
+        const candidates = [];
+        const walk = (el, path) => {
+          if (!(el instanceof Element)) return;
+          const type = getType(el);
+          const name = getName(el);
+          const text = (el.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 220);
+          const placeholder = (el.getAttribute("placeholder") || "").trim();
+          const inputType = el instanceof HTMLInputElement ? (el.type || "") : "";
+          const score = scoreElement(el, type, name, text, placeholder, inputType);
+
+          if (score > 0) {
+            const rect = el.getBoundingClientRect();
+            const visible = isVisible(el);
+            const item = {
+              ref: "ref_" + refHash(path),
+              type,
+              name,
+              text,
+              visible,
+              coordinates: [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2)],
+              placeholder: placeholder || undefined,
+              inputType: inputType || undefined,
+              score,
+            };
+            candidates.push(item);
+          }
+
+          const children = Array.from(el.children);
+          for (let i = 0; i < children.length; i += 1) {
+            const child = children[i];
+            const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+            walk(child, childPath);
+          }
+        };
+
+        walk(root, root.tagName.toLowerCase() + ":0");
+
+        candidates.sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          if (Number(b.visible) !== Number(a.visible)) return Number(b.visible) - Number(a.visible);
+          return a.name.localeCompare(b.name);
+        });
+
+        const deduped = [];
+        const seenRefs = new Set();
+        for (const c of candidates) {
+          if (seenRefs.has(c.ref)) continue;
+          seenRefs.add(c.ref);
+          deduped.push({
+            ref: c.ref,
+            type: c.type,
+            name: c.name,
+            ...(c.text ? { text: c.text } : {}),
+            visible: c.visible,
+            coordinates: c.coordinates,
+            ...(c.placeholder ? { placeholder: c.placeholder } : {}),
+            ...(c.inputType ? { inputType: c.inputType } : {}),
+          });
+        }
+
+        const limited = deduped.length > 20;
+        const results = deduped.slice(0, 20);
+        return {
+          results,
+          count: results.length,
+          ...(limited
+            ? {
+                limited: true,
+                message:
+                  "More than 20 matches found. Use a more specific query to narrow results.",
+              }
+            : {}),
+        };
+      })()`;
+
+      const evaluation = (await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+        expression: extractionScript,
+        awaitPromise: true,
+        returnByValue: true,
+        allowUnsafeEvalBlockedByCSP: true,
+      })) as {
+        result?: { value?: unknown };
+        exceptionDetails?: { text?: string; exception?: { description?: string } };
+      };
+
+      if (evaluation.exceptionDetails) {
+        const message =
+          evaluation.exceptionDetails.exception?.description ||
+          evaluation.exceptionDetails.text ||
+          "Unknown find error";
+        return JSON.stringify({
+          results: [],
+          count: 0,
+          error: message,
+        });
+      }
+
+      return JSON.stringify(
+        evaluation.result?.value ?? {
+          results: [],
+          count: 0,
+        }
+      );
+    } catch (error) {
+      return JSON.stringify({
+        results: [],
+        count: 0,
+        error: String(error),
+      });
+    } finally {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch {
+        // Ignore detach errors.
+      }
+    }
+  },
+  {
+    name: "find",
+    description:
+      "Find elements on the page using natural language query and return up to 20 matches with refs usable by other tools.",
+    schema: z.object({
+      query: z.string().min(1).describe("Natural language element query, e.g. 'search bar' or 'submit button'."),
+      tabId: z.number().int().describe("Tab ID to search in. Must be in current tab group/context."),
+    }),
+  }
+);
+
 const turnAnswerStartTool = tool(
   async () => {
     return JSON.stringify({
@@ -807,6 +1028,7 @@ const tools = [
   tabsContextTool,
   tabsCreateTool,
   readPageTool,
+  findTool,
   navigateTool,
   resizeWindowTool,
   getPageTextTool,
@@ -908,6 +1130,22 @@ function parseDirectCommand(input: string): ToolCall | null {
           ...((parsedFilter === "interactive" || parsedFilter === "all") ? { filter: parsedFilter } : {}),
           ...(Number.isInteger(parsedMaxChars) ? { max_chars: parsedMaxChars } : {}),
           ...(parsedRefId ? { ref_id: parsedRefId } : {}),
+        },
+      };
+    }
+  }
+
+  if (trimmed.startsWith("/find")) {
+    const raw = trimmed.replace(/^\/find\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    const queryText = parts.slice(1).join(" ").trim();
+    if (Number.isInteger(parsedTabId) && queryText) {
+      return {
+        name: findTool.name,
+        args: {
+          tabId: parsedTabId,
+          query: queryText,
         },
       };
     }
@@ -1024,6 +1262,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call tabs_context first when you need a valid tabId or when the user asks about available tabs. " +
         "Call tabs_create to create a new tab in the current tab group/context. " +
         "Call read_page with tabId and optional depth/filter/max_chars/ref_id to inspect page structure and get ref IDs. " +
+        "Call find with tabId and a natural language query to locate matching elements quickly. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +
