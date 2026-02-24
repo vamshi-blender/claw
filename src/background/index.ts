@@ -4,6 +4,7 @@ type RunGraphRequest = {
   type: "RUN_GRAPH";
   threadId: string;
   input: string;
+  requestId?: string;
 };
 
 const THREAD_PREFIX = "thread:";
@@ -66,7 +67,27 @@ chrome.runtime.onMessage.addListener((message: RunGraphRequest, _sender, sendRes
       }
 
       const seed = await loadThreadState(message.threadId);
-      const result = await runGraphTurn(message.threadId, message.input, llmSettings, seed);
+      const result = await runGraphTurn(
+        message.threadId,
+        message.input,
+        llmSettings,
+        seed,
+        (progressMessage) => {
+          if (!message.requestId) {
+            return;
+          }
+          void chrome.runtime
+            .sendMessage({
+              type: "RUN_GRAPH_PROGRESS",
+              requestId: message.requestId,
+              threadId: message.threadId,
+              message: progressMessage,
+            })
+            .catch(() => {
+              // Ignore if there is no active sidepanel listener.
+            });
+        }
+      );
       await saveThreadState(message.threadId, result.state);
       sendResponse({ ok: true, ...result });
     } catch (error) {

@@ -236,27 +236,58 @@ const navigateTool = tool(
   }
 );
 
-const runJsTool = tool(
-  async ({ script }) => {
-    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    if (!tab?.id) {
-      return "No active tab found.";
+const turnAnswerStartTool = tool(
+  async () => {
+    return JSON.stringify({
+      success: true,
+      action: "turn_answer_start",
+      readyForResponse: true,
+    });
+  },
+  {
+    name: "turn_answer_start",
+    description:
+      "Call immediately before writing the final text response for a turn. This is a signaling tool with no parameters.",
+    schema: z.object({}),
+  }
+);
+
+const javascriptTool = tool(
+  async ({ action, text, tabId }) => {
+    if (action !== "javascript_exec") {
+      return JSON.stringify({
+        success: false,
+        action,
+        code: text,
+        tabId,
+        error: "Invalid action. Expected 'javascript_exec'.",
+      });
     }
 
-    const debuggee: chrome.debugger.Debuggee = { tabId: tab.id };
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        success: false,
+        action,
+        code: text,
+        tabId,
+        error: scope.error,
+      });
+    }
 
+    const debuggee: chrome.debugger.Debuggee = { tabId };
     try {
       await chrome.debugger.attach(debuggee, "1.3");
       await chrome.debugger.sendCommand(debuggee, "Runtime.enable");
 
       const evaluation = (await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
-        expression: script,
+        expression: text,
         awaitPromise: true,
         returnByValue: true,
         allowUnsafeEvalBlockedByCSP: true,
       })) as {
         result?: { value?: unknown; description?: string };
-        exceptionDetails?: { text?: string; exception?: { description?: string; value?: unknown } };
+        exceptionDetails?: { text?: string; exception?: { description?: string } };
       };
 
       if (evaluation.exceptionDetails) {
@@ -264,23 +295,30 @@ const runJsTool = tool(
           evaluation.exceptionDetails.exception?.description ||
           evaluation.exceptionDetails.text ||
           "Unknown script error";
-        return `Script error: ${message}`;
+        return JSON.stringify({
+          success: false,
+          action,
+          code: text,
+          tabId,
+          error: message,
+        });
       }
 
-      const value = evaluation.result?.value;
-      if (typeof value === "string") {
-        return `Script result: ${value}`;
-      }
-      if (value === undefined) {
-        return "Script result: undefined";
-      }
-      try {
-        return `Script result: ${JSON.stringify(value)}`;
-      } catch {
-        return `Script result: ${evaluation.result?.description ?? String(value)}`;
-      }
+      return JSON.stringify({
+        success: true,
+        action,
+        code: text,
+        tabId,
+        result: evaluation.result?.value ?? evaluation.result?.description ?? "undefined",
+      });
     } catch (error) {
-      return `Script error: ${String(error)}`;
+      return JSON.stringify({
+        success: false,
+        action,
+        code: text,
+        tabId,
+        error: String(error),
+      });
     } finally {
       try {
         await chrome.debugger.detach(debuggee);
@@ -290,16 +328,21 @@ const runJsTool = tool(
     }
   },
   {
-    name: "run_js_current_tab",
+    name: "javascript_tool",
     description:
-      "Run JavaScript on the current active tab and return the output. Use this when user asks to execute JS in browser.",
+      "Execute JavaScript code in the context of a tab. Requires action='javascript_exec', text code, and tabId from tabs_context.",
     schema: z.object({
-      script: z.string().min(1).describe("JavaScript code to execute on the active tab."),
+      action: z.literal("javascript_exec").describe("Must be 'javascript_exec'."),
+      text: z
+        .string()
+        .min(1)
+        .describe("JavaScript code to evaluate in page context. Do not include a return statement."),
+      tabId: z.number().int().describe("Tab ID to execute code in. Must be in current tab group/context."),
     }),
   }
 );
 
-const tools = [tabsContextTool, navigateTool, runJsTool];
+const tools = [tabsContextTool, navigateTool, javascriptTool, turnAnswerStartTool];
 const toolNode = new ToolNode(tools);
 const checkpointer = new MemorySaver();
 let fallbackSettings: LlmSettings | undefined;
@@ -322,6 +365,30 @@ function getMessageType(message: BaseMessage): string {
     return msg.getType();
   }
   return msg.type ?? "unknown";
+}
+
+function getMessageId(message: BaseMessage): string | undefined {
+  const msg = message as unknown as { id?: string };
+  return msg.id;
+}
+
+function getToolCallSummary(message: BaseMessage): string | null {
+  const maybeAi = message as unknown as {
+    tool_calls?: Array<{ name?: string }>;
+  };
+  const names = (maybeAi.tool_calls ?? [])
+    .map((call) => call.name?.trim())
+    .filter((name): name is string => Boolean(name));
+
+  if (names.length === 0) {
+    return null;
+  }
+
+  if (names.length === 1) {
+    return `Calling tool: ${names[0]}`;
+  }
+
+  return `Calling tools: ${names.join(", ")}`;
 }
 
 function parseDirectCommand(input: string): ToolCall | null {
@@ -347,12 +414,21 @@ function parseDirectCommand(input: string): ToolCall | null {
     }
   }
 
-  if (trimmed.startsWith("/runjs")) {
-    const script = trimmed.replace(/^\/runjs\s*/, "");
-    return {
-      name: runJsTool.name,
-      args: { script: script || "throw new Error('No script provided')" },
-    };
+  if (trimmed.startsWith("/javascript_exec")) {
+    const raw = trimmed.replace(/^\/javascript_exec\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    const script = parts.slice(1).join(" ").trim();
+    if (Number.isInteger(parsedTabId) && script) {
+      return {
+        name: javascriptTool.name,
+        args: {
+          action: "javascript_exec",
+          tabId: parsedTabId,
+          text: script,
+        },
+      };
+    }
   }
 
   return null;
@@ -412,10 +488,11 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
 
   const response = await model.invoke([
     new SystemMessage(
-      "You are a Chrome extension assistant. Use tool calling when actions are needed. " +
+        "You are a Chrome extension assistant. Use tool calling when actions are needed. " +
         "Call tabs_context first when you need a valid tabId or when the user asks about available tabs. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
-        "Call run_js_current_tab when user asks to run JavaScript on the current page. " +
+        "Call javascript_tool with action='javascript_exec', text, and tabId when user asks to run JavaScript on a page. " +
+        "Call turn_answer_start immediately before your final user-facing response in every turn. " +
         "For page location use window.location.href. Prefer scripts that return a value."
     ),
     ...state.messages,
@@ -434,13 +511,19 @@ const graph = new StateGraph(MessagesAnnotation)
 
 function toPersistedMessage(message: BaseMessage): PersistedMessage {
   const type = getMessageType(message);
-  const content = getTextContent(message.content);
+  let content = getTextContent(message.content);
 
   if (type === "human") {
     return { role: "user", content };
   }
   if (type === "tool") {
     return { role: "tool", content };
+  }
+  if (!content.trim()) {
+    const summary = getToolCallSummary(message);
+    if (summary) {
+      content = summary;
+    }
   }
   return { role: "assistant", content };
 }
@@ -473,17 +556,29 @@ function findLastTool(messages: BaseMessage[]): string | null {
   return null;
 }
 
-export async function runGraphTurn(threadId: string, input: string, settings: LlmSettings, seed?: PersistedThreadState) {
+export async function runGraphTurn(
+  threadId: string,
+  input: string,
+  settings: LlmSettings,
+  seed?: PersistedThreadState,
+  onProgress?: (message: PersistedMessage) => void
+) {
   const threadConfig = {
     configurable: {
       thread_id: threadId,
     },
   };
 
+  let previousMessageCount = 0;
   let hasCheckpoint = false;
+  let checkpointMessagesCount = 0;
   try {
     const checkpointState = await graph.getState(threadConfig);
     hasCheckpoint = Boolean(checkpointState?.values);
+    const rawMessages = (checkpointState?.values as { messages?: unknown } | undefined)?.messages;
+    if (Array.isArray(rawMessages)) {
+      checkpointMessagesCount = rawMessages.length;
+    }
   } catch {
     hasCheckpoint = false;
   }
@@ -491,18 +586,61 @@ export async function runGraphTurn(threadId: string, input: string, settings: Ll
   const seedMessages = hasCheckpoint
     ? []
     : (seed?.messages ?? []).map(fromPersistedMessage);
+  previousMessageCount = hasCheckpoint ? checkpointMessagesCount : seedMessages.length;
 
-  let state: Awaited<ReturnType<typeof graph.invoke>>;
+  let state: Awaited<ReturnType<typeof graph.invoke>> | null = null;
   fallbackSettings = settings;
   try {
+    const stream = (await graph.stream(
+      {
+        messages: [...seedMessages, new HumanMessage(input)],
+      },
+      {
+        ...threadConfig,
+        streamMode: "values",
+      }
+    )) as AsyncIterable<{ messages?: BaseMessage[] }>;
+
+    const emittedMessageIds = new Set<string>();
+    for await (const chunk of stream) {
+      const streamMessages = chunk.messages;
+      if (!streamMessages || !Array.isArray(streamMessages)) {
+        continue;
+      }
+
+      state = chunk as Awaited<ReturnType<typeof graph.invoke>>;
+      if (!onProgress) {
+        continue;
+      }
+
+      const candidateMessages = streamMessages.slice(previousMessageCount);
+      for (const message of candidateMessages) {
+        const messageId = getMessageId(message);
+        if (messageId && emittedMessageIds.has(messageId)) {
+          continue;
+        }
+        if (messageId) {
+          emittedMessageIds.add(messageId);
+        }
+
+        const persisted = toPersistedMessage(message);
+        if (persisted.role !== "assistant" || !persisted.content.trim()) {
+          continue;
+        }
+        onProgress(persisted);
+      }
+    }
+  } finally {
+    fallbackSettings = undefined;
+  }
+
+  if (!state) {
     state = await graph.invoke(
       {
         messages: [...seedMessages, new HumanMessage(input)],
       },
       threadConfig
     );
-  } finally {
-    fallbackSettings = undefined;
   }
 
   const messages = state.messages as BaseMessage[];

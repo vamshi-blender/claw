@@ -7,33 +7,24 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <main class="panel">
-      <h1>LangGraph Orchestrator</h1>
-      <p class="sub">Ask naturally (for example: run JS to get page title) or use <code>/runjs ...</code> / <code>/cdp ...</code>.</p>
-
-      <label>
-        Thread ID
-        <div class="thread-row">
-          <input id="threadId" type="text" value="default-thread" />
-          <button id="newThreadBtn" type="button" title="Generate new thread ID">+</button>
+    <main class="chat-shell">
+      <header class="chat-topbar">
+        <button id="newThreadBtn" class="icon-btn" type="button" title="New thread">+</button>
+        <div class="topbar-actions">
+          <button id="memoryToggleBtn" class="icon-btn" type="button" title="Show thread memory" aria-label="Toggle thread memory">M</button>
+          <button id="optionsBtn" class="icon-btn" type="button" title="Settings" aria-label="Settings">S</button>
         </div>
-      </label>
+      </header>
 
-      <label>
-        Input
-        <textarea id="prompt" rows="4" placeholder="Ask a question or try: /cdp click #login-button"></textarea>
-      </label>
+      <section id="messages" class="messages" aria-live="polite"></section>
 
-      <button id="runBtn" type="button">Send</button>
-      <button id="optionsBtn" type="button">Open Options</button>
+      <footer class="composer">
+        <textarea id="prompt" rows="1" placeholder="Type a message"></textarea>
+        <button id="runBtn" type="button">Send</button>
+      </footer>
 
-      <section>
-        <h2>Latest Result</h2>
-        <pre id="latest"></pre>
-      </section>
-
-      <section>
-        <h2>Thread Memory</h2>
+      <section id="debugPanel" class="debug-panel hidden" aria-hidden="true">
+        <input id="threadId" type="text" value="default-thread" />
         <pre id="memory"></pre>
       </section>
     </main>

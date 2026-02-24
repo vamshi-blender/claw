@@ -1,12 +1,12 @@
 :root {
   color-scheme: light;
   font-family: "Segoe UI", "SF Pro Text", "Helvetica Neue", sans-serif;
-  --bg: #f4f6fb;
+  --bg: #f3f5fa;
   --panel: #ffffff;
-  --ink: #16213f;
-  --ink-muted: #4f5f88;
-  --accent: #0d7a66;
-  --border: #d3dbef;
+  --ink: #1d2538;
+  --ink-muted: #5d667d;
+  --accent: #1f6feb;
+  --border: #d6dceb;
 }
 
 * {
@@ -15,78 +15,154 @@
 
 body {
   margin: 0;
-  background: radial-gradient(circle at top, #dce9ff 0%, var(--bg) 40%);
+  background: var(--bg);
   color: var(--ink);
 }
 
-.panel {
-  padding: 16px;
+.chat-shell {
+  height: 100vh;
   display: grid;
-  gap: 12px;
+  grid-template-rows: auto 1fr auto;
+  overflow: hidden;
 }
 
-h1,
-h2 {
-  margin: 0;
+.chat-topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
 }
 
-.sub {
-  margin: 0;
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  overflow: auto;
+}
+
+.message {
+  max-width: 90%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.message.user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #fff;
+}
+
+.message.assistant {
+  align-self: flex-start;
+  background: #fff;
+  border: 1px solid var(--border);
+  color: var(--ink);
+}
+
+.message.assistant.tool-call {
+  background: #f3f6fc;
   color: var(--ink-muted);
+  font-size: 13px;
 }
 
-label {
-  display: grid;
-  gap: 6px;
-  font-weight: 600;
+.message.system {
+  align-self: center;
+  background: #eef2fb;
+  color: var(--ink-muted);
+  border: 1px dashed var(--border);
 }
 
-.thread-row {
+.composer {
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 8px;
-  align-items: center;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  align-items: end;
 }
 
-#newThreadBtn {
-  padding: 8px 12px;
-  min-width: 40px;
-}
-
-input,
-textarea,
-select,
-button {
+.composer textarea,
+.composer button {
   font: inherit;
 }
 
-input,
-textarea,
-select {
+.composer textarea {
+  resize: none;
+  min-height: 40px;
+  max-height: 140px;
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px;
-  background: var(--panel);
+  background: #fff;
 }
 
-button {
+.composer button {
   border: none;
   border-radius: 10px;
   padding: 10px 14px;
   background: var(--accent);
-  color: white;
-  font-weight: 700;
+  color: #fff;
+  font-weight: 600;
   cursor: pointer;
 }
 
-pre {
+.debug-panel {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  background: #eef2fb;
+}
+
+.debug-panel input,
+.debug-panel pre {
+  width: 100%;
   margin: 0;
+  font: inherit;
+}
+
+.debug-panel input {
   border: 1px solid var(--border);
-  background: var(--panel);
-  border-radius: 10px;
-  padding: 10px;
+  border-radius: 8px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.debug-panel pre {
+  max-height: 160px;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 220px;
-  overflow: auto;
+}
+
+.hidden {
+  display: none !important;
 }
