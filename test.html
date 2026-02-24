@@ -75,6 +75,12 @@
   </div>
 </section>
 
+<section id="file-select-tests">
+  <h2>File Select Test</h2>
+  <input type="file" id="fileInput" />
+  <p id="fileOutput">No file selected</p>
+</section>
+
 <section id="scroll-tests">
   <h2>Scroll Test</h2>
   <div class="spacer"></div>
@@ -123,6 +129,18 @@
     const y = e.clientY - rect.top - draggable.clientHeight / 2;
     draggable.style.left = Math.max(0, Math.min(rect.width - draggable.clientWidth, x)) + 'px';
     draggable.style.top = Math.max(0, Math.min(rect.height - draggable.clientHeight, y)) + 'px';
+  });
+
+  // File select
+  const fileInput = document.getElementById('fileInput');
+  const fileOutput = document.getElementById('fileOutput');
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (file) {
+      fileOutput.textContent = 'Selected: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+    } else {
+      fileOutput.textContent = 'No file selected';
+    }
   });
 
   // Hover visual feedback (already CSS)

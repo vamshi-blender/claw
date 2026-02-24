@@ -966,6 +966,218 @@ async function captureTabScreenshotDataUrl(tabId: number) {
   });
 }
 
+function isAbsoluteLocalPath(path: string) {
+  if (!path) {
+    return false;
+  }
+
+  if (/^[a-zA-Z]:\\/.test(path)) {
+    return true;
+  }
+  if (/^\\\\[^\\]/.test(path)) {
+    return true;
+  }
+  if (path.startsWith("/")) {
+    return true;
+  }
+
+  return false;
+}
+
+async function getElementMetadataByRef(tabId: number, ref: string) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [ref],
+    func: (targetRef: string) => {
+      const refHash = (input: string) => {
+        let hash = 0;
+        for (let i = 0; i < input.length; i += 1) {
+          hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+        }
+        return Math.abs(hash).toString(36);
+      };
+
+      const getRef = (path: string) => `ref_${refHash(path)}`;
+      const root = document.documentElement || document.body;
+      if (!root) {
+        return { success: false, error: "No document root found." };
+      }
+
+      const findByRef = (el: Element, path: string): Element | null => {
+        if (getRef(path) === targetRef) {
+          return el;
+        }
+        const children = Array.from(el.children);
+        for (let i = 0; i < children.length; i += 1) {
+          const child = children[i];
+          const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+          const found = findByRef(child, childPath);
+          if (found) {
+            return found;
+          }
+        }
+        return null;
+      };
+
+      const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+      if (!target) {
+        return {
+          success: false,
+          error: "Element reference not found. Use read_page/find again to refresh refs.",
+        };
+      }
+
+      if (!(target instanceof HTMLInputElement)) {
+        return {
+          success: false,
+          error: "Referenced element is not an input element.",
+          tagName: target.tagName.toLowerCase(),
+        };
+      }
+
+      const inputType = (target.type || "").toLowerCase();
+      if (inputType !== "file") {
+        return {
+          success: false,
+          error: `Referenced input is type='${inputType || "unknown"}', expected type='file'.`,
+        };
+      }
+
+      return {
+        success: true,
+        targetElement: {
+          ref: targetRef,
+          type: "input",
+          inputType: "file",
+          multiple: target.multiple,
+          ...(target.accept ? { accept: target.accept } : {}),
+        },
+      };
+    },
+  });
+
+  return (
+    (injection?.result as
+      | {
+          success: true;
+          targetElement: {
+            ref: string;
+            type: "input";
+            inputType: "file";
+            multiple: boolean;
+            accept?: string;
+          };
+        }
+      | { success: false; error: string; tagName?: string }
+      | undefined) ??
+    { success: false as const, error: "Failed to inspect target file input element." }
+  );
+}
+
+async function readUploadedFilesFromInput(tabId: number, ref: string) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [ref],
+    func: async (targetRef: string) => {
+      const refHash = (input: string) => {
+        let hash = 0;
+        for (let i = 0; i < input.length; i += 1) {
+          hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+        }
+        return Math.abs(hash).toString(36);
+      };
+
+      const getRef = (path: string) => `ref_${refHash(path)}`;
+      const root = document.documentElement || document.body;
+      if (!root) {
+        return { success: false, error: "No document root found.", files: [] };
+      }
+
+      const findByRef = (el: Element, path: string): Element | null => {
+        if (getRef(path) === targetRef) {
+          return el;
+        }
+        const children = Array.from(el.children);
+        for (let i = 0; i < children.length; i += 1) {
+          const child = children[i];
+          const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+          const found = findByRef(child, childPath);
+          if (found) {
+            return found;
+          }
+        }
+        return null;
+      };
+
+      const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+      if (!(target instanceof HTMLInputElement) || target.type.toLowerCase() !== "file") {
+        return {
+          success: false,
+          error: "Target element is not a file input.",
+          files: [],
+        };
+      }
+
+      const files = Array.from(target.files ?? []);
+      const filesUploaded: Array<{
+        filename: string;
+        size: number;
+        mimeType?: string;
+        dimensions?: string;
+      }> = [];
+
+      for (const file of files) {
+        const fileData: {
+          filename: string;
+          size: number;
+          mimeType?: string;
+          dimensions?: string;
+        } = {
+          filename: file.name,
+          size: file.size,
+        };
+
+        if (file.type) {
+          fileData.mimeType = file.type;
+        }
+
+        if (file.type.startsWith("image/")) {
+          try {
+            const bitmap = await createImageBitmap(file);
+            fileData.dimensions = `${bitmap.width}x${bitmap.height}`;
+            bitmap.close();
+          } catch {
+            // Ignore image dimension parsing errors.
+          }
+        }
+
+        filesUploaded.push(fileData);
+      }
+
+      return {
+        success: true,
+        files: filesUploaded,
+      };
+    },
+  });
+
+  return (
+    (injection?.result as
+      | {
+          success: true;
+          files: Array<{
+            filename: string;
+            size: number;
+            mimeType?: string;
+            dimensions?: string;
+          }>;
+        }
+      | { success: false; error: string; files: unknown[] }
+      | undefined) ??
+    { success: false as const, error: "Failed to read uploaded file details from input.", files: [] }
+  );
+}
+
 async function dataUrlToBlob(dataUrl: string) {
   const response = await fetch(dataUrl);
   return response.blob();
@@ -2467,6 +2679,198 @@ const computerTool = tool(
   }
 );
 
+const fileUploadTool = tool(
+  async ({ paths, ref, tabId }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        success: false,
+        action: "file_upload",
+        tabId,
+        ref,
+        error: scope.error,
+      });
+    }
+
+    return withTabActionLock(tabId, async () => {
+      const fail = (message: string, extras: Record<string, unknown> = {}) =>
+        JSON.stringify({
+          success: false,
+          action: "file_upload",
+          tabId,
+          ref,
+          ...extras,
+          error: message,
+        });
+
+      if (!Array.isArray(paths) || paths.length === 0) {
+        return fail("Parameter 'paths' must contain at least one absolute file path.");
+      }
+
+      const normalizedPaths = paths.map((p) => String(p).trim()).filter(Boolean);
+      if (normalizedPaths.length === 0) {
+        return fail("Parameter 'paths' must contain at least one non-empty path.");
+      }
+
+      for (const path of normalizedPaths) {
+        if (!isAbsoluteLocalPath(path)) {
+          return fail(`Path must be absolute: '${path}'`);
+        }
+      }
+
+      const elementMeta = await getElementMetadataByRef(tabId, ref);
+      if (!elementMeta.success) {
+        return fail(elementMeta.error, elementMeta.tagName ? { tagName: elementMeta.tagName } : {});
+      }
+
+      if (!elementMeta.targetElement.multiple && normalizedPaths.length > 1) {
+        return fail(
+          "Target file input does not allow multiple files. Provide a single file path or choose an input with 'multiple'.",
+          { providedFiles: normalizedPaths.length }
+        );
+      }
+
+      try {
+        const markerAttr = "data-claw-upload-target";
+        const markerValue = `upload_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+        try {
+          const markResult = await chrome.scripting.executeScript({
+            target: { tabId },
+            args: [ref, markerAttr, markerValue],
+            func: (targetRef: string, attrName: string, attrValue: string) => {
+              const refHash = (input: string) => {
+                let hash = 0;
+                for (let i = 0; i < input.length; i += 1) {
+                  hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+                }
+                return Math.abs(hash).toString(36);
+              };
+
+              const getRef = (path: string) => `ref_${refHash(path)}`;
+              const root = document.documentElement || document.body;
+              if (!root) {
+                return { success: false, error: "No document root found." };
+              }
+
+              const findByRef = (el: Element, path: string): Element | null => {
+                if (getRef(path) === targetRef) {
+                  return el;
+                }
+                const children = Array.from(el.children);
+                for (let i = 0; i < children.length; i += 1) {
+                  const child = children[i];
+                  const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+                  const found = findByRef(child, childPath);
+                  if (found) {
+                    return found;
+                  }
+                }
+                return null;
+              };
+
+              const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+              if (!(target instanceof HTMLInputElement) || target.type.toLowerCase() !== "file") {
+                return { success: false, error: "Target element is not a file input." };
+              }
+
+              target.setAttribute(attrName, attrValue);
+              return { success: true };
+            },
+          });
+
+          const markPayload = markResult?.[0]?.result as
+            | { success: true }
+            | { success: false; error: string }
+            | undefined;
+          if (!markPayload?.success) {
+            return fail(markPayload?.error ?? "Failed to mark target file input element.");
+          }
+
+          await withDebuggerSession(tabId, async (debuggee) => {
+            await chrome.debugger.sendCommand(debuggee, "Runtime.enable");
+            await chrome.debugger.sendCommand(debuggee, "DOM.enable");
+            const doc = (await chrome.debugger.sendCommand(debuggee, "DOM.getDocument", {
+              depth: 1,
+              pierce: true,
+            })) as { root?: { nodeId?: number } };
+            const rootNodeId = doc.root?.nodeId;
+            if (!rootNodeId) {
+              throw new Error("Failed to resolve root document node.");
+            }
+
+            const selector = `[${markerAttr}="${markerValue}"]`;
+            const query = (await chrome.debugger.sendCommand(debuggee, "DOM.querySelector", {
+              nodeId: rootNodeId,
+              selector,
+            })) as { nodeId?: number };
+            if (!query.nodeId) {
+              throw new Error("Failed to resolve DOM node for target file input.");
+            }
+
+            await chrome.debugger.sendCommand(debuggee, "DOM.setFileInputFiles", {
+              files: normalizedPaths,
+              nodeId: query.nodeId,
+            });
+          });
+        } finally {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            args: [markerAttr, markerValue],
+            func: (attrName: string, attrValue: string) => {
+              const el = document.querySelector(`[${attrName}="${attrValue}"]`);
+              if (el) {
+                el.removeAttribute(attrName);
+              }
+            },
+          });
+        }
+      } catch (error) {
+        return fail(String(error));
+      }
+
+      const uploaded = await readUploadedFilesFromInput(tabId, ref);
+      if (!uploaded.success) {
+        return fail(uploaded.error);
+      }
+
+      const filesUploaded = uploaded.files.map((file, index) => ({
+        path: normalizedPaths[index] ?? file.filename,
+        filename: file.filename,
+        size: file.size,
+        ...(file.mimeType ? { mimeType: file.mimeType } : {}),
+        ...(file.dimensions ? { dimensions: file.dimensions } : {}),
+      }));
+
+      return JSON.stringify({
+        success: true,
+        action: "file_upload",
+        tabId,
+        filesUploaded,
+        targetElement: elementMeta.targetElement,
+        uploadCompleted: true,
+        ...(filesUploaded.length > 1 ? { totalFilesUploaded: filesUploaded.length } : {}),
+      });
+    });
+  },
+  {
+    name: "file_upload",
+    description:
+      "Upload one or multiple absolute local file paths to a file input element identified by ref. Requires paths, ref, and tabId.",
+    schema: z.object({
+      paths: z
+        .array(z.string().min(1))
+        .min(1)
+        .describe("Absolute local file paths to upload. Can contain one or multiple files."),
+      ref: z
+        .string()
+        .min(1)
+        .describe("Element reference ID for the target file input from read_page/find (e.g., 'ref_8')."),
+      tabId: z.number().int().describe("Tab ID where the target file input is located."),
+    }),
+  }
+);
+
 const turnAnswerStartTool = tool(
   async () => {
     return JSON.stringify({
@@ -2580,6 +2984,7 @@ const tools = [
   findTool,
   formInputTool,
   computerTool,
+  fileUploadTool,
   navigateTool,
   resizeWindowTool,
   getPageTextTool,
@@ -2752,6 +3157,24 @@ function parseDirectCommand(input: string): ToolCall | null {
     }
   }
 
+  if (trimmed.startsWith("/file_upload")) {
+    const raw = trimmed.replace(/^\/file_upload\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    const parsedRef = parts[1];
+    const paths = parts.slice(2);
+    if (Number.isInteger(parsedTabId) && parsedRef && paths.length > 0) {
+      return {
+        name: fileUploadTool.name,
+        args: {
+          tabId: parsedTabId,
+          ref: parsedRef,
+          paths,
+        },
+      };
+    }
+  }
+
   return null;
 }
 
@@ -2816,6 +3239,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call find with tabId and a natural language query to locate matching elements quickly. " +
         "Call form_input with tabId, ref, and value to set form fields (including inputs, selects, and textareas). " +
         "Call computer with action and tabId for mouse/keyboard interactions, scrolling, waiting, drag, hover, screenshots, and zoom. " +
+        "Call file_upload with tabId, ref, and absolute local file paths to upload files directly to file input elements. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +
