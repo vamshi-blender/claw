@@ -27,17 +27,211 @@ export type PersistedThreadState = {
   lastToolResult: string | null;
 };
 
-const mockCdpTool = tool(
-  async ({ action, target }) => {
-    return `Mock CDP executed action='${action}' target='${target ?? ""}'`;
+type DomainSkillHint = {
+  domain: string;
+  skill: string;
+};
+
+const DOMAIN_SKILL_HINTS: DomainSkillHint[] = [
+  {
+    domain: "amazon.com",
+    skill: "Use 'Add to Cart' buttons and 'Proceed to Checkout' workflow",
   },
   {
-    name: "mock_cdp_action",
+    domain: "mail.google.com",
+    skill: "Gmail interface: compose with keyboard shortcut 'c', archive with 'e', search using filter syntax",
+  },
+  {
+    domain: "docs.example.com",
+    skill: "Search documentation with the search box in the header, use left sidebar for navigation",
+  },
+  {
+    domain: "example.com",
+    skill: "Static example page with basic HTML structure",
+  },
+];
+
+function parseHostname(rawUrl: string | undefined): string | null {
+  if (!rawUrl) {
+    return null;
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function findDomainSkills(urls: Array<string | undefined>) {
+  const matches = new Map<string, DomainSkillHint>();
+  for (const rawUrl of urls) {
+    const hostname = parseHostname(rawUrl);
+    if (!hostname) {
+      continue;
+    }
+    for (const hint of DOMAIN_SKILL_HINTS) {
+      if (hostname === hint.domain || hostname.endsWith(`.${hint.domain}`)) {
+        matches.set(hint.domain, hint);
+      }
+    }
+  }
+  return Array.from(matches.values());
+}
+
+async function getCurrentContextTab() {
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  return tab;
+}
+
+async function validateTabInCurrentScope(tabId: number) {
+  const contextTab = await getCurrentContextTab();
+  if (!contextTab?.id) {
+    return { ok: false as const, error: "No active tab found for current context." };
+  }
+
+  let targetTab: chrome.tabs.Tab;
+  try {
+    targetTab = await chrome.tabs.get(tabId);
+  } catch {
+    return { ok: false as const, error: `Tab ${tabId} was not found.` };
+  }
+
+  const contextGroupId = contextTab.groupId ?? -1;
+  if (contextGroupId >= 0 && targetTab.groupId !== contextGroupId) {
+    return {
+      ok: false as const,
+      error: `Tab ${tabId} is not in the current tab group. Use tabs_context to get valid tabs.`,
+    };
+  }
+
+  if (contextGroupId < 0 && targetTab.id !== contextTab.id) {
+    return {
+      ok: false as const,
+      error:
+        `Tab ${tabId} is outside the current tab context. Use tabs_context to get the current valid tab.`,
+    };
+  }
+
+  return { ok: true as const, contextTab, targetTab };
+}
+
+function normalizeNavigateUrl(input: string) {
+  const trimmed = input.trim();
+  if (trimmed === "back" || trimmed === "forward") {
+    return { kind: trimmed as "back" | "forward" };
+  }
+
+  if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(trimmed)) {
+    return { kind: "url" as const, url: trimmed };
+  }
+
+  return { kind: "url" as const, url: `https://${trimmed}` };
+}
+
+const tabsContextTool = tool(
+  async () => {
+    const [initialTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!initialTab?.id) {
+      return JSON.stringify({ availableTabs: [], initialTabId: null });
+    }
+
+    const isGrouped = typeof initialTab.groupId === "number" && initialTab.groupId >= 0;
+    const tabs = isGrouped
+      ? await chrome.tabs.query({ groupId: initialTab.groupId })
+      : [initialTab];
+
+    const availableTabs = tabs
+      .filter((tab) => typeof tab.id === "number")
+      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+      .map((tab) => ({
+        tabId: tab.id as number,
+        title: tab.title ?? "",
+        url: tab.url ?? "",
+      }));
+
+    const domainSkills = findDomainSkills(tabs.map((tab) => tab.url));
+    const response: {
+      availableTabs: Array<{ tabId: number; title: string; url: string }>;
+      initialTabId: number;
+      domainSkills?: DomainSkillHint[];
+    } = {
+      availableTabs,
+      initialTabId: initialTab.id,
+    };
+
+    if (domainSkills.length > 0) {
+      response.domainSkills = domainSkills;
+    }
+
+    return JSON.stringify(response);
+  },
+  {
+    name: "tabs_context",
     description:
-      "Execute a mocked Chrome DevTools action. Use when user asks to click, navigate, inspect, or control the browser.",
+      "Get context information about all tabs in the current tab group, including availableTabs, initialTabId, and optional domainSkills.",
+    schema: z.object({}),
+  }
+);
+
+const navigateTool = tool(
+  async ({ url, tabId }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({ success: false, action: "navigate", tabId, error: scope.error });
+    }
+
+    const normalized = normalizeNavigateUrl(url);
+    try {
+      if (normalized.kind === "back") {
+        await chrome.tabs.goBack(tabId);
+        return JSON.stringify({
+          success: true,
+          action: "navigate",
+          tabId,
+          navigation: "back",
+        });
+      }
+      if (normalized.kind === "forward") {
+        await chrome.tabs.goForward(tabId);
+        return JSON.stringify({
+          success: true,
+          action: "navigate",
+          tabId,
+          navigation: "forward",
+        });
+      }
+
+      const updated = await chrome.tabs.update(tabId, { url: normalized.url });
+      return JSON.stringify({
+        success: true,
+        action: "navigate",
+        tabId,
+        requestedUrl: url,
+        finalUrl: updated.url ?? normalized.url,
+      });
+    } catch (error) {
+      return JSON.stringify({
+        success: false,
+        action: "navigate",
+        tabId,
+        error: String(error),
+      });
+    }
+  },
+  {
+    name: "navigate",
+    description:
+      "Navigate a tab to a URL, or move back/forward in history. Requires url and tabId. URL defaults to https:// when protocol is omitted.",
     schema: z.object({
-      action: z.string().describe("CDP action name, e.g. click, navigate"),
-      target: z.string().optional().describe("Optional selector or URL target"),
+      url: z
+        .string()
+        .min(1)
+        .describe("Destination URL, or 'back'/'forward' for history navigation."),
+      tabId: z.number().int().describe("Target tab ID. Must be in the current tab group/context."),
     }),
   }
 );
@@ -105,7 +299,7 @@ const runJsTool = tool(
   }
 );
 
-const tools = [runJsTool, mockCdpTool];
+const tools = [tabsContextTool, navigateTool, runJsTool];
 const toolNode = new ToolNode(tools);
 const checkpointer = new MemorySaver();
 let fallbackSettings: LlmSettings | undefined;
@@ -133,21 +327,31 @@ function getMessageType(message: BaseMessage): string {
 function parseDirectCommand(input: string): ToolCall | null {
   const trimmed = input.trim();
 
+  if (trimmed === "/tabs_context" || trimmed === "/tabs") {
+    return {
+      name: tabsContextTool.name,
+      args: {},
+    };
+  }
+
+  if (trimmed.startsWith("/navigate")) {
+    const raw = trimmed.replace(/^\/navigate\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    const target = parts.slice(1).join(" ").trim();
+    if (Number.isInteger(parsedTabId) && target) {
+      return {
+        name: navigateTool.name,
+        args: { tabId: parsedTabId, url: target },
+      };
+    }
+  }
+
   if (trimmed.startsWith("/runjs")) {
     const script = trimmed.replace(/^\/runjs\s*/, "");
     return {
       name: runJsTool.name,
       args: { script: script || "throw new Error('No script provided')" },
-    };
-  }
-
-  if (trimmed.startsWith("/cdp")) {
-    const parts = trimmed.split(/\s+/);
-    const action = parts[1] ?? "noop";
-    const target = parts.slice(2).join(" ") || undefined;
-    return {
-      name: mockCdpTool.name,
-      args: { action, target },
     };
   }
 
@@ -209,9 +413,10 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
   const response = await model.invoke([
     new SystemMessage(
       "You are a Chrome extension assistant. Use tool calling when actions are needed. " +
+        "Call tabs_context first when you need a valid tabId or when the user asks about available tabs. " +
+        "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call run_js_current_tab when user asks to run JavaScript on the current page. " +
-        "For page location use window.location.href. Prefer scripts that return a value. " +
-        "Call mock_cdp_action for browser-control actions."
+        "For page location use window.location.href. Prefer scripts that return a value."
     ),
     ...state.messages,
   ]);
