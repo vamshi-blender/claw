@@ -367,6 +367,83 @@ const resizeWindowTool = tool(
   }
 );
 
+const getPageTextTool = tool(
+  async ({ tabId, max_chars }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return `Error: ${scope.error}`;
+    }
+
+    const maxChars = typeof max_chars === "number" ? max_chars : 50000;
+    const debuggee: chrome.debugger.Debuggee = { tabId };
+
+    try {
+      await chrome.debugger.attach(debuggee, "1.3");
+      await chrome.debugger.sendCommand(debuggee, "Runtime.enable");
+
+      const extractionScript = `(() => {
+        const clean = (value) => String(value ?? "").replace(/\\s+/g, " ").trim();
+        const article = document.querySelector("article");
+        const main = document.querySelector("main");
+        const target = article || main || document.body;
+        const text = clean(target ? (target.innerText || target.textContent || "") : "");
+        return text;
+      })()`;
+
+      const evaluation = (await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+        expression: extractionScript,
+        awaitPromise: true,
+        returnByValue: true,
+        allowUnsafeEvalBlockedByCSP: true,
+      })) as {
+        result?: { value?: unknown; description?: string };
+        exceptionDetails?: { text?: string; exception?: { description?: string } };
+      };
+
+      if (evaluation.exceptionDetails) {
+        const message =
+          evaluation.exceptionDetails.exception?.description ||
+          evaluation.exceptionDetails.text ||
+          "Unknown extraction error";
+        return `Error: ${message}`;
+      }
+
+      const text = String(evaluation.result?.value ?? "").trim();
+      if (!text) {
+        return "";
+      }
+
+      if (text.length > maxChars) {
+        return `Error: Page text length (${text.length}) exceeds max_chars (${maxChars}). Increase max_chars or narrow the target page.`;
+      }
+
+      return text;
+    } catch (error) {
+      return `Error: ${String(error)}`;
+    } finally {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch {
+        // Ignore detach errors.
+      }
+    }
+  },
+  {
+    name: "get_page_text",
+    description:
+      "Extract raw text from a tab, prioritizing article/main content. Returns plain text. Requires tabId; optional max_chars (default 50000).",
+    schema: z.object({
+      tabId: z.number().int().describe("Tab ID to extract text from. Must be in current tab group/context."),
+      max_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Maximum characters to return. Defaults to 50000."),
+    }),
+  }
+);
+
 const turnAnswerStartTool = tool(
   async () => {
     return JSON.stringify({
@@ -473,7 +550,15 @@ const javascriptTool = tool(
   }
 );
 
-const tools = [tabsContextTool, tabsCreateTool, navigateTool, resizeWindowTool, javascriptTool, turnAnswerStartTool];
+const tools = [
+  tabsContextTool,
+  tabsCreateTool,
+  navigateTool,
+  resizeWindowTool,
+  getPageTextTool,
+  javascriptTool,
+  turnAnswerStartTool,
+];
 const toolNode = new ToolNode(tools);
 const checkpointer = new MemorySaver();
 let fallbackSettings: LlmSettings | undefined;
@@ -570,6 +655,21 @@ function parseDirectCommand(input: string): ToolCall | null {
     }
   }
 
+  if (trimmed.startsWith("/get_page_text")) {
+    const raw = trimmed.replace(/^\/get_page_text\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    const parsedMaxChars = Number.parseInt(parts[1] ?? "", 10);
+    if (Number.isInteger(parsedTabId)) {
+      return {
+        name: getPageTextTool.name,
+        args: Number.isInteger(parsedMaxChars)
+          ? { tabId: parsedTabId, max_chars: parsedMaxChars }
+          : { tabId: parsedTabId },
+      };
+    }
+  }
+
   if (trimmed.startsWith("/javascript_exec")) {
     const raw = trimmed.replace(/^\/javascript_exec\s*/, "");
     const parts = raw.split(/\s+/).filter(Boolean);
@@ -649,6 +749,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call tabs_create to create a new tab in the current tab group/context. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
+        "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +
         "Call javascript_tool with action='javascript_exec', text, and tabId when user asks to run JavaScript on a page. " +
         "Call turn_answer_start immediately before your final user-facing response in every turn. " +
         "For page location use window.location.href. Prefer scripts that return a value."
