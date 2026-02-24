@@ -444,6 +444,259 @@ const getPageTextTool = tool(
   }
 );
 
+const readPageTool = tool(
+  async ({ tabId, depth, filter, max_chars, ref_id }) => {
+    const scope = await validateTabInCurrentScope(tabId);
+    if (!scope.ok) {
+      return JSON.stringify({
+        error: scope.error,
+      });
+    }
+
+    const maxDepth = typeof depth === "number" ? depth : 15;
+    const mode = filter ?? "all";
+    const maxChars = typeof max_chars === "number" ? max_chars : 50000;
+    const debuggee: chrome.debugger.Debuggee = { tabId };
+
+    try {
+      await chrome.debugger.attach(debuggee, "1.3");
+      await chrome.debugger.sendCommand(debuggee, "Runtime.enable");
+
+      const extractionScript = `(() => {
+        const maxDepth = ${JSON.stringify(maxDepth)};
+        const mode = ${JSON.stringify(mode)};
+        const refId = ${JSON.stringify(ref_id ?? null)};
+
+        const isElementInteractive = (el) => {
+          if (!(el instanceof Element)) return false;
+          const tag = el.tagName.toLowerCase();
+          const role = (el.getAttribute("role") || "").toLowerCase();
+          const hasHref = tag === "a" && !!el.getAttribute("href");
+          const nativeInteractive = ["button", "input", "select", "textarea", "summary"].includes(tag);
+          const roleInteractive = ["button", "link", "checkbox", "radio", "switch", "tab", "menuitem", "textbox", "combobox", "searchbox", "slider", "spinbutton"].includes(role);
+          const tabbable = el.hasAttribute("tabindex") && el.getAttribute("tabindex") !== "-1";
+          const editable = (el).isContentEditable === true;
+          return hasHref || nativeInteractive || roleInteractive || tabbable || editable;
+        };
+
+        const refHash = (input) => {
+          let hash = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+          }
+          return Math.abs(hash).toString(36);
+        };
+
+        const getNodeName = (el) => {
+          if (!(el instanceof Element)) return "";
+          const ariaLabel = el.getAttribute("aria-label");
+          if (ariaLabel) return ariaLabel.trim();
+          const labelledBy = el.getAttribute("aria-labelledby");
+          if (labelledBy) {
+            const parts = labelledBy
+              .split(/\\s+/)
+              .map((id) => document.getElementById(id)?.textContent?.trim())
+              .filter(Boolean);
+            if (parts.length > 0) return parts.join(" ");
+          }
+          if (el instanceof HTMLInputElement && el.labels && el.labels.length > 0) {
+            const labelText = Array.from(el.labels).map((l) => l.textContent?.trim()).filter(Boolean).join(" ");
+            if (labelText) return labelText;
+          }
+          const title = el.getAttribute("title");
+          if (title) return title.trim();
+          const alt = el.getAttribute("alt");
+          if (alt) return alt.trim();
+          const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+          return text.slice(0, 120);
+        };
+
+        const getType = (el) => {
+          if (!(el instanceof Element)) return "node";
+          const role = (el.getAttribute("role") || "").toLowerCase();
+          if (role) return role;
+          const tag = el.tagName.toLowerCase();
+          if (tag === "input") {
+            const type = (el.getAttribute("type") || "text").toLowerCase();
+            if (type === "checkbox") return "checkbox";
+            if (type === "radio") return "radio";
+            if (type === "search") return "searchbox";
+            if (type === "email" || type === "text" || type === "password" || type === "number") return "textbox";
+          }
+          if (tag === "textarea") return "textbox";
+          if (tag === "a") return "link";
+          return tag;
+        };
+
+        const buildNode = (el, currentDepth, path) => {
+          if (!(el instanceof Element)) return null;
+          const ref = "ref_" + refHash(path);
+          const node = {
+            ref,
+            type: getType(el),
+          };
+
+          const name = getNodeName(el);
+          if (name) node.name = name;
+          if (el instanceof HTMLAnchorElement && el.getAttribute("href")) node.url = el.getAttribute("href");
+          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) node.value = el.value ?? "";
+          if (el instanceof HTMLInputElement) {
+            if (el.type === "checkbox" || el.type === "radio") node.checked = el.checked;
+            if (el.type) node.inputType = el.type;
+            if (el.placeholder) node.placeholder = el.placeholder;
+          }
+          if (el instanceof HTMLSelectElement) {
+            node.options = Array.from(el.options).map((o) => o.text);
+            node.value = el.value;
+          }
+          if ("disabled" in el) node.disabled = !!el.disabled;
+          if (/^h[1-6]$/.test(el.tagName.toLowerCase())) node.level = Number(el.tagName[1]);
+          if (["h1", "h2", "h3", "h4", "h5", "h6", "p", "span"].includes(el.tagName.toLowerCase())) {
+            const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+            if (text) node.text = text.slice(0, 200);
+          }
+
+          if (currentDepth >= maxDepth) return node;
+
+          const children = [];
+          const allChildren = Array.from(el.children);
+          for (let i = 0; i < allChildren.length; i += 1) {
+            const child = allChildren[i];
+            const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+            const childNode = buildNode(child, currentDepth + 1, childPath);
+            if (!childNode) continue;
+            if (mode === "interactive") {
+              if (isElementInteractive(child)) {
+                children.push(childNode);
+              }
+            } else {
+              children.push(childNode);
+            }
+          }
+          if (children.length > 0 && mode !== "interactive") {
+            node.children = children;
+          }
+          return node;
+        };
+
+        const rootEl = document.documentElement || document.body;
+        if (!rootEl) return { tree: [] };
+
+        const rootPath = rootEl.tagName.toLowerCase() + ":0";
+        const fullTree = buildNode(rootEl, 0, rootPath);
+        if (!fullTree) return { tree: [] };
+
+        const flattenInteractive = (node, acc) => {
+          if (!node) return;
+          const el = document.querySelector("*"); // placeholder for type narrowing only
+          if (node.type && node.ref) {
+            // Keep flattened nodes for interactive mode
+            acc.push(Object.fromEntries(Object.entries(node).filter(([k]) => k !== "children")));
+          }
+          if (node.children) {
+            for (const child of node.children) flattenInteractive(child, acc);
+          }
+        };
+
+        const findByRef = (node, targetRef) => {
+          if (!node) return null;
+          if (node.ref === targetRef) return node;
+          if (!node.children) return null;
+          for (const child of node.children) {
+            const found = findByRef(child, targetRef);
+            if (found) return found;
+          }
+          return null;
+        };
+
+        if (mode === "interactive") {
+          const interactiveCandidates = [];
+          const walk = (el, currentDepth, path) => {
+            if (!(el instanceof Element) || currentDepth > maxDepth) return;
+            if (isElementInteractive(el)) {
+              const node = buildNode(el, currentDepth, path);
+              if (node) {
+                delete node.children;
+                interactiveCandidates.push(node);
+              }
+            }
+            const allChildren = Array.from(el.children);
+            for (let i = 0; i < allChildren.length; i += 1) {
+              const child = allChildren[i];
+              const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+              walk(child, currentDepth + 1, childPath);
+            }
+          };
+          walk(rootEl, 0, rootPath);
+          if (refId) {
+            const matched = interactiveCandidates.find((n) => n.ref === refId);
+            return { tree: matched ? [matched] : [] };
+          }
+          return { tree: interactiveCandidates };
+        }
+
+        if (refId) {
+          const focused = findByRef(fullTree, refId);
+          return { tree: focused ? [focused] : [] };
+        }
+
+        return { tree: [fullTree] };
+      })()`;
+
+      const evaluation = (await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+        expression: extractionScript,
+        awaitPromise: true,
+        returnByValue: true,
+        allowUnsafeEvalBlockedByCSP: true,
+      })) as {
+        result?: { value?: unknown; description?: string };
+        exceptionDetails?: { text?: string; exception?: { description?: string } };
+      };
+
+      if (evaluation.exceptionDetails) {
+        const message =
+          evaluation.exceptionDetails.exception?.description ||
+          evaluation.exceptionDetails.text ||
+          "Unknown read_page error";
+        return JSON.stringify({ error: message });
+      }
+
+      const payload = evaluation.result?.value ?? { tree: [] };
+      const serialized = JSON.stringify(payload);
+      if (serialized.length > maxChars) {
+        return JSON.stringify({
+          error:
+            `Output exceeds max_chars (${maxChars}). Use smaller depth, filter='interactive', or ref_id to focus a subtree.`,
+        });
+      }
+
+      return serialized;
+    } catch (error) {
+      return JSON.stringify({
+        error: String(error),
+      });
+    } finally {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch {
+        // Ignore detach errors.
+      }
+    }
+  },
+  {
+    name: "read_page",
+    description:
+      "Read page structure as a ref-based tree. Supports tabId, optional depth (default 15), filter ('all'|'interactive'), max_chars (default 50000), and ref_id for focused subtree reads.",
+    schema: z.object({
+      tabId: z.number().int().describe("Tab ID to read from. Must be in current tab group/context."),
+      depth: z.number().int().positive().optional().describe("Maximum traversal depth. Defaults to 15."),
+      filter: z.enum(["interactive", "all"]).optional().describe("Element filter mode. Defaults to 'all'."),
+      max_chars: z.number().int().positive().optional().describe("Maximum output size in characters. Defaults to 50000."),
+      ref_id: z.string().optional().describe("Optional element ref to read focused subtree."),
+    }),
+  }
+);
+
 const turnAnswerStartTool = tool(
   async () => {
     return JSON.stringify({
@@ -553,6 +806,7 @@ const javascriptTool = tool(
 const tools = [
   tabsContextTool,
   tabsCreateTool,
+  readPageTool,
   navigateTool,
   resizeWindowTool,
   getPageTextTool,
@@ -633,6 +887,28 @@ function parseDirectCommand(input: string): ToolCall | null {
       return {
         name: navigateTool.name,
         args: { tabId: parsedTabId, url: target },
+      };
+    }
+  }
+
+  if (trimmed.startsWith("/read_page")) {
+    const raw = trimmed.replace(/^\/read_page\s*/, "");
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const parsedTabId = Number.parseInt(parts[0] ?? "", 10);
+    if (Number.isInteger(parsedTabId)) {
+      const parsedDepth = Number.parseInt(parts[1] ?? "", 10);
+      const parsedFilter = parts[2];
+      const parsedMaxChars = Number.parseInt(parts[3] ?? "", 10);
+      const parsedRefId = parts[4];
+      return {
+        name: readPageTool.name,
+        args: {
+          tabId: parsedTabId,
+          ...(Number.isInteger(parsedDepth) ? { depth: parsedDepth } : {}),
+          ...((parsedFilter === "interactive" || parsedFilter === "all") ? { filter: parsedFilter } : {}),
+          ...(Number.isInteger(parsedMaxChars) ? { max_chars: parsedMaxChars } : {}),
+          ...(parsedRefId ? { ref_id: parsedRefId } : {}),
+        },
       };
     }
   }
@@ -747,6 +1023,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "You are a Chrome extension assistant. Use tool calling when actions are needed. " +
         "Call tabs_context first when you need a valid tabId or when the user asks about available tabs. " +
         "Call tabs_create to create a new tab in the current tab group/context. " +
+        "Call read_page with tabId and optional depth/filter/max_chars/ref_id to inspect page structure and get ref IDs. " +
         "Call navigate to open URLs or go back/forward on a specific tabId from tabs_context. " +
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +
