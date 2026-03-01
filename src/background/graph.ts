@@ -132,6 +132,53 @@ function normalizeNavigateUrl(input: string) {
   return { kind: "url" as const, url: `https://${trimmed}` };
 }
 
+async function waitForTabLoadComplete(tabId: number, timeoutMs = 15000): Promise<chrome.tabs.Tab> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      reject(new Error(`Timed out waiting for tab ${tabId} to finish loading.`));
+    }, timeoutMs);
+
+    const onUpdated = (
+      updatedTabId: number,
+      changeInfo: chrome.tabs.TabChangeInfo,
+      tab: chrome.tabs.Tab
+    ) => {
+      if (updatedTabId !== tabId) {
+        return;
+      }
+      if (changeInfo.status !== "complete") {
+        return;
+      }
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve(tab);
+    };
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    void chrome.tabs.get(tabId).then((tab) => {
+      if (settled) {
+        return;
+      }
+      if (tab.status === "complete") {
+        settled = true;
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(onUpdated);
+        resolve(tab);
+      }
+    }).catch(() => {
+      // Ignore transient get failures and rely on onUpdated or timeout.
+    });
+  });
+}
+
 function classifyDeviceType(width: number) {
   if (width <= 480) {
     return "mobile";
@@ -658,6 +705,31 @@ async function dispatchKeyToken(
   return { ok: true as const, key: keyDef.key };
 }
 
+async function evaluateTabWithDebugger<T>(tabId: number, expression: string): Promise<T> {
+  return withDebuggerSession(tabId, async (debuggee) => {
+    await chrome.debugger.sendCommand(debuggee, "Runtime.enable");
+    const evaluation = (await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+      allowUnsafeEvalBlockedByCSP: true,
+    })) as {
+      result?: { value?: unknown; description?: string };
+      exceptionDetails?: { text?: string; exception?: { description?: string } };
+    };
+
+    if (evaluation.exceptionDetails) {
+      const message =
+        evaluation.exceptionDetails.exception?.description ||
+        evaluation.exceptionDetails.text ||
+        "Unknown debugger evaluation error";
+      throw new Error(message);
+    }
+
+    return evaluation.result?.value as T;
+  });
+}
+
 async function resolveRefToElement(
   tabId: number,
   ref: string,
@@ -666,10 +738,11 @@ async function resolveRefToElement(
   | { success: true; coordinate: [number, number]; element: ElementSummary }
   | { success: false; error: string }
 > {
-  const [injection] = await chrome.scripting.executeScript({
-    target: { tabId },
-    args: [ref, scrollIntoView],
-    func: (targetRef: string, shouldScroll: boolean) => {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [ref, scrollIntoView],
+      func: (targetRef: string, shouldScroll: boolean) => {
       const refHash = (input: string) => {
         let hash = 0;
         for (let i = 0; i < input.length; i += 1) {
@@ -769,24 +842,134 @@ async function resolveRefToElement(
           visible: isVisible(found.target),
         },
       };
-    },
-  });
+      },
+    });
 
-  const result = injection?.result as
-    | { success: true; coordinate: [number, number]; element: ElementSummary }
-    | { success: false; error: string }
-    | undefined;
+    const result = injection?.result as
+      | { success: true; coordinate: [number, number]; element: ElementSummary }
+      | { success: false; error: string }
+      | undefined;
 
-  return (
-    result ?? {
-      success: false,
-      error: "Failed to resolve element reference.",
+    return (
+      result ?? {
+        success: false,
+        error: "Failed to resolve element reference.",
+      }
+    );
+  } catch {
+    try {
+      const fallback = await evaluateTabWithDebugger<
+        | { success: true; coordinate: [number, number]; element: ElementSummary }
+        | { success: false; error: string }
+      >(
+        tabId,
+        `(() => {
+        const targetRef = ${JSON.stringify(ref)};
+        const shouldScroll = ${JSON.stringify(scrollIntoView)};
+
+        const refHash = (input) => {
+          let hash = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+          }
+          return Math.abs(hash).toString(36);
+        };
+
+        const getRef = (path) => "ref_" + refHash(path);
+        const getType = (el) => {
+          const role = (el.getAttribute("role") || "").toLowerCase();
+          if (role) return role;
+          const tag = el.tagName.toLowerCase();
+          if (tag === "input") {
+            const inputType = (el.getAttribute("type") || "text").toLowerCase();
+            if (inputType === "checkbox") return "checkbox";
+            if (inputType === "radio") return "radio";
+            if (inputType === "search") return "searchbox";
+            return "textbox";
+          }
+          if (tag === "textarea") return "textbox";
+          if (tag === "a") return "link";
+          return tag;
+        };
+
+        const getName = (el) => {
+          const aria = (el.getAttribute("aria-label") || "").trim();
+          if (aria) return aria;
+          const title = (el.getAttribute("title") || "").trim();
+          if (title) return title;
+          if (el instanceof HTMLInputElement && el.labels && el.labels.length > 0) {
+            const labelText = Array.from(el.labels).map((label) => (label.textContent || "").trim()).filter(Boolean).join(" ");
+            if (labelText) return labelText;
+          }
+          const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+          return text.slice(0, 120);
+        };
+
+        const isVisible = (el) => {
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+            return false;
+          }
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+
+        const root = document.documentElement || document.body;
+        if (!root) return { success: false, error: "No document root found." };
+
+        const findByRef = (el, path) => {
+          if (!(el instanceof Element)) return null;
+          if (getRef(path) === targetRef) return el;
+          const children = Array.from(el.children);
+          for (let i = 0; i < children.length; i += 1) {
+            const child = children[i];
+            const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+            const found = findByRef(child, childPath);
+            if (found) return found;
+          }
+          return null;
+        };
+
+        const target = findByRef(root, root.tagName.toLowerCase() + ":0");
+        if (!target) {
+          return {
+            success: false,
+            error: "Element reference not found. Use read_page/find again to refresh refs.",
+          };
+        }
+
+        if (shouldScroll && target instanceof HTMLElement) {
+          target.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        }
+
+        const rect = target.getBoundingClientRect();
+        return {
+          success: true,
+          coordinate: [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2)],
+          element: {
+            ref: targetRef,
+            type: getType(target),
+            name: getName(target) || undefined,
+            visible: isVisible(target),
+          },
+        };
+        })()`
+      );
+      return (
+        fallback ?? {
+          success: false,
+          error: "Failed to resolve element reference.",
+        }
+      );
+    } catch (error) {
+      return { success: false, error: String(error) };
     }
-  );
+  }
 }
 
 async function describeElementAtCoordinate(tabId: number, coordinate: [number, number]) {
-  const [injection] = await chrome.scripting.executeScript({
+  try {
+    const [injection] = await chrome.scripting.executeScript({
     target: { tabId },
     args: [coordinate[0], coordinate[1]],
     func: (x: number, y: number) => {
@@ -877,10 +1060,95 @@ async function describeElementAtCoordinate(tabId: number, coordinate: [number, n
     | { element: ElementSummary | null; tooltipShown: boolean; tooltipText?: string }
     | undefined;
   return result ?? { element: null, tooltipShown: false };
+  } catch {
+    try {
+      const fallback = await evaluateTabWithDebugger<
+        { element: ElementSummary | null; tooltipShown: boolean; tooltipText?: string }
+      >(
+        tabId,
+        `(() => {
+          const x = ${JSON.stringify(coordinate[0])};
+          const y = ${JSON.stringify(coordinate[1])};
+          const refHash = (input) => {
+            let hash = 0;
+            for (let i = 0; i < input.length; i += 1) {
+              hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+            }
+            return Math.abs(hash).toString(36);
+          };
+          const buildPath = (el) => {
+            const segments = [];
+            let current = el;
+            while (current) {
+              const parent = current.parentElement;
+              const index = parent ? Array.from(parent.children).indexOf(current) : 0;
+              segments.push(current.tagName.toLowerCase() + ":" + Math.max(index, 0));
+              if (!parent) break;
+              current = parent;
+            }
+            return segments.reverse().join(">");
+          };
+          const getType = (el) => {
+            const role = (el.getAttribute("role") || "").toLowerCase();
+            if (role) return role;
+            const tag = el.tagName.toLowerCase();
+            if (tag === "input") {
+              const inputType = (el.getAttribute("type") || "text").toLowerCase();
+              if (inputType === "checkbox") return "checkbox";
+              if (inputType === "radio") return "radio";
+              if (inputType === "search") return "searchbox";
+              return "textbox";
+            }
+            if (tag === "textarea") return "textbox";
+            if (tag === "a") return "link";
+            return tag;
+          };
+          const getName = (el) => {
+            const aria = (el.getAttribute("aria-label") || "").trim();
+            if (aria) return aria;
+            const title = (el.getAttribute("title") || "").trim();
+            if (title) return title;
+            if (el instanceof HTMLInputElement && el.labels && el.labels.length > 0) {
+              const labelText = Array.from(el.labels).map((label) => (label.textContent || "").trim()).filter(Boolean).join(" ");
+              if (labelText) return labelText;
+            }
+            const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+            return text.slice(0, 120);
+          };
+          const isVisible = (el) => {
+            const style = window.getComputedStyle(el);
+            if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+              return false;
+            }
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          };
+          const element = document.elementFromPoint(x, y);
+          if (!element) return { element: null, tooltipShown: false };
+          const path = buildPath(element);
+          const tooltip = (element.getAttribute("title") || "").trim();
+          return {
+            element: {
+              ref: "ref_" + refHash(path),
+              type: getType(element),
+              name: getName(element) || undefined,
+              visible: isVisible(element),
+            },
+            tooltipShown: Boolean(tooltip),
+            tooltipText: tooltip || undefined,
+          };
+        })()`
+      );
+      return fallback ?? { element: null, tooltipShown: false };
+    } catch {
+      return { element: null, tooltipShown: false };
+    }
+  }
 }
 
 async function readActiveFieldValue(tabId: number) {
-  const [injection] = await chrome.scripting.executeScript({
+  try {
+    const [injection] = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => {
       const active = document.activeElement;
@@ -912,10 +1180,40 @@ async function readActiveFieldValue(tabId: number) {
     (injection?.result as { hasActiveField: boolean; value?: string; inputType?: string } | undefined) ??
     { hasActiveField: false }
   );
+  } catch {
+    try {
+      const fallback = await evaluateTabWithDebugger<{ hasActiveField: boolean; value?: string; inputType?: string }>(
+        tabId,
+        `(() => {
+          const active = document.activeElement;
+          if (!active) return { hasActiveField: false };
+          if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+            return {
+              hasActiveField: true,
+              value: active.value ?? "",
+              inputType: active instanceof HTMLInputElement ? active.type : "textarea",
+            };
+          }
+          if (active instanceof HTMLElement && active.isContentEditable) {
+            return {
+              hasActiveField: true,
+              value: active.textContent ?? "",
+              inputType: "contenteditable",
+            };
+          }
+          return { hasActiveField: false };
+        })()`
+      );
+      return fallback ?? { hasActiveField: false };
+    } catch {
+      return { hasActiveField: false };
+    }
+  }
 }
 
 async function getScrollMetrics(tabId: number) {
-  const [injection] = await chrome.scripting.executeScript({
+  try {
+    const [injection] = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => ({
       scrollX: Math.round(window.scrollX),
@@ -933,10 +1231,32 @@ async function getScrollMetrics(tabId: number) {
     (injection?.result as { scrollX: number; scrollY: number; pageWidth: number; pageHeight: number } | undefined) ??
     { scrollX: 0, scrollY: 0, pageWidth: 0, pageHeight: 0 }
   );
+  } catch {
+    try {
+      const fallback = await evaluateTabWithDebugger<{
+        scrollX: number;
+        scrollY: number;
+        pageWidth: number;
+        pageHeight: number;
+      }>(
+        tabId,
+        `(() => ({
+          scrollX: Math.round(window.scrollX),
+          scrollY: Math.round(window.scrollY),
+          pageWidth: Math.round(Math.max(document.body?.scrollWidth ?? 0, document.documentElement?.scrollWidth ?? 0)),
+          pageHeight: Math.round(Math.max(document.body?.scrollHeight ?? 0, document.documentElement?.scrollHeight ?? 0)),
+        }))()`
+      );
+      return fallback ?? { scrollX: 0, scrollY: 0, pageWidth: 0, pageHeight: 0 };
+    } catch {
+      return { scrollX: 0, scrollY: 0, pageWidth: 0, pageHeight: 0 };
+    }
+  }
 }
 
 async function getViewportMetrics(tabId: number) {
-  const [injection] = await chrome.scripting.executeScript({
+  try {
+    const [injection] = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => ({
       width: window.innerWidth,
@@ -949,6 +1269,21 @@ async function getViewportMetrics(tabId: number) {
     (injection?.result as { width: number; height: number; devicePixelRatio: number } | undefined) ??
     { width: 0, height: 0, devicePixelRatio: 1 }
   );
+  } catch {
+    try {
+      const fallback = await evaluateTabWithDebugger<{ width: number; height: number; devicePixelRatio: number }>(
+        tabId,
+        `(() => ({
+          width: window.innerWidth,
+          height: window.innerHeight,
+          devicePixelRatio: window.devicePixelRatio || 1,
+        }))()`
+      );
+      return fallback ?? { width: 0, height: 0, devicePixelRatio: 1 };
+    } catch {
+      return { width: 0, height: 0, devicePixelRatio: 1 };
+    }
+  }
 }
 
 async function captureTabScreenshotDataUrl(tabId: number) {
@@ -1727,7 +2062,7 @@ const tabsContextTool = tool(
   {
     name: "tabs_context",
     description:
-      "Get context information about all tabs in the current tab group, including availableTabs, initialTabId, and optional domainSkills.",
+      "**Description:** Retrieve the current browser tab state, including all open tabs in the tab group with their tab IDs, titles, URLs, and which tab is currently active. Takes no input parameters. Call this before any tab-related action to avoid duplicating tabs or acting on stale state. Use whenever the user refers to \"this page\", \"current tab\", \"my tabs\", or any request that depends on knowing what is currently open in the browser.",
     schema: z.object({}),
   }
 );
@@ -1777,7 +2112,7 @@ const tabsCreateTool = tool(
   {
     name: "tabs_create",
     description:
-      "Create a new empty tab in the current tab group. This tool takes no parameters.",
+      "**Description:** Open a new browser tab with the specified URL. Requires a single parameter: the full URL to navigate to (e.g., \"https://google.com\"). For web searches, construct the URL as \"https://www.google.com/search?q=<encoded_query>\". Before calling this tool, always call tabs_context first to check if a tab with the target URL is already open — if it is, switch to the existing tab instead of creating a duplicate. Returns the new tab's ID, URL, and title once loaded.",
     schema: z.object({}),
   }
 );
@@ -1810,13 +2145,39 @@ const navigateTool = tool(
         });
       }
 
-      const updated = await chrome.tabs.update(tabId, { url: normalized.url });
+      await chrome.tabs.update(tabId, { url: normalized.url });
+      let finalTab: chrome.tabs.Tab | null = null;
+      try {
+        finalTab = await waitForTabLoadComplete(tabId);
+      } catch {
+        // Best effort: still inspect current tab URL to report accurate state.
+        try {
+          finalTab = await chrome.tabs.get(tabId);
+        } catch {
+          finalTab = null;
+        }
+      }
+
+      const finalUrl = finalTab?.url ?? "";
+      const isRestricted = finalUrl.startsWith("chrome://") || finalUrl.startsWith("edge://");
+      if (isRestricted) {
+        return JSON.stringify({
+          success: false,
+          action: "navigate",
+          tabId,
+          requestedUrl: url,
+          finalUrl,
+          error:
+            "Navigation did not leave a restricted browser page. Open a normal web page first, then retry.",
+        });
+      }
+
       return JSON.stringify({
         success: true,
         action: "navigate",
         tabId,
         requestedUrl: url,
-        finalUrl: updated.url ?? normalized.url,
+        finalUrl,
       });
     } catch (error) {
       return JSON.stringify({
@@ -2032,6 +2393,19 @@ const readPageTool = tool(
           return Math.abs(hash).toString(36);
         };
 
+        const buildPath = (el) => {
+          const segments = [];
+          let current = el;
+          while (current) {
+            const parent = current.parentElement;
+            const index = parent ? Array.from(parent.children).indexOf(current) : 0;
+            segments.push(current.tagName.toLowerCase() + ":" + Math.max(index, 0));
+            if (!parent) break;
+            current = parent;
+          }
+          return segments.reverse().join(">");
+        };
+
         const getNodeName = (el) => {
           if (!(el instanceof Element)) return "";
           const ariaLabel = el.getAttribute("aria-label");
@@ -2071,6 +2445,59 @@ const readPageTool = tool(
           if (tag === "textarea") return "textbox";
           if (tag === "a") return "link";
           return tag;
+        };
+
+        const toCompactNode = (el) => {
+          if (!(el instanceof Element)) return null;
+          const path = buildPath(el);
+          if (!path) return null;
+          const node = {
+            ref: "ref_" + refHash(path),
+            type: getType(el),
+          };
+          const name = getNodeName(el);
+          if (name) node.name = name;
+          if (el instanceof HTMLInputElement) {
+            if (el.type) node.inputType = el.type;
+            if (el.placeholder) node.placeholder = el.placeholder;
+            node.value = el.value ?? "";
+          }
+          if (el instanceof HTMLTextAreaElement) {
+            if (el.placeholder) node.placeholder = el.placeholder;
+            node.value = el.value ?? "";
+          }
+          if (el instanceof HTMLSelectElement) {
+            node.value = el.value;
+            node.options = Array.from(el.options).map((o) => o.text);
+          }
+          if ("disabled" in el) node.disabled = !!el.disabled;
+          return node;
+        };
+
+        const collectBasicInteractive = () => {
+          const selectors = [
+            "input",
+            "textarea",
+            "select",
+            "button",
+            "a[href]",
+            "[role='button']",
+            "[role='link']",
+            "[contenteditable='true']",
+          ];
+          const seen = new Set();
+          const nodes = [];
+          const elements = Array.from(document.querySelectorAll(selectors.join(",")));
+          for (const el of elements) {
+            if (!(el instanceof Element)) continue;
+            const path = buildPath(el);
+            if (!path || seen.has(path)) continue;
+            seen.add(path);
+            const node = toCompactNode(el);
+            if (node) nodes.push(node);
+            if (nodes.length >= 200) break;
+          }
+          return nodes;
         };
 
         const buildNode = (el, currentDepth, path) => {
@@ -2125,11 +2552,33 @@ const readPageTool = tool(
         };
 
         const rootEl = document.documentElement || document.body;
-        if (!rootEl) return { tree: [] };
+        if (!rootEl) {
+          return {
+            tree: collectBasicInteractive(),
+            meta: {
+              fallback: true,
+              reason: "no_document_root",
+              url: window.location.href,
+              title: document.title || "",
+              readyState: document.readyState,
+            },
+          };
+        }
 
         const rootPath = rootEl.tagName.toLowerCase() + ":0";
         const fullTree = buildNode(rootEl, 0, rootPath);
-        if (!fullTree) return { tree: [] };
+        if (!fullTree) {
+          return {
+            tree: collectBasicInteractive(),
+            meta: {
+              fallback: true,
+              reason: "failed_build_tree",
+              url: window.location.href,
+              title: document.title || "",
+              readyState: document.readyState,
+            },
+          };
+        }
 
         const flattenInteractive = (node, acc) => {
           if (!node) return;
@@ -2177,6 +2626,18 @@ const readPageTool = tool(
             const matched = interactiveCandidates.find((n) => n.ref === refId);
             return { tree: matched ? [matched] : [] };
           }
+          if (interactiveCandidates.length === 0) {
+            return {
+              tree: collectBasicInteractive(),
+              meta: {
+                fallback: true,
+                reason: "no_interactive_candidates",
+                url: window.location.href,
+                title: document.title || "",
+                readyState: document.readyState,
+              },
+            };
+          }
           return { tree: interactiveCandidates };
         }
 
@@ -2206,7 +2667,107 @@ const readPageTool = tool(
         return JSON.stringify({ error: message });
       }
 
-      const payload = evaluation.result?.value ?? { tree: [] };
+      let payload = evaluation.result?.value ?? { tree: [] };
+      const currentTree = (payload as { tree?: unknown })?.tree;
+      if (!ref_id && Array.isArray(currentTree) && currentTree.length === 0) {
+        const fallbackExtraction = (await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+          expression: `(() => {
+            const refHash = (input) => {
+              let hash = 0;
+              for (let i = 0; i < input.length; i += 1) {
+                hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+              }
+              return Math.abs(hash).toString(36);
+            };
+            const buildPath = (el) => {
+              const segments = [];
+              let current = el;
+              while (current) {
+                const parent = current.parentElement;
+                const index = parent ? Array.from(parent.children).indexOf(current) : 0;
+                segments.push(current.tagName.toLowerCase() + ":" + Math.max(index, 0));
+                if (!parent) break;
+                current = parent;
+              }
+              return segments.reverse().join(">");
+            };
+            const getName = (el) => {
+              const aria = (el.getAttribute("aria-label") || "").trim();
+              if (aria) return aria;
+              const title = (el.getAttribute("title") || "").trim();
+              if (title) return title;
+              if (el instanceof HTMLInputElement && el.labels && el.labels.length > 0) {
+                const labelText = Array.from(el.labels).map((label) => (label.textContent || "").trim()).filter(Boolean).join(" ");
+                if (labelText) return labelText;
+              }
+              const text = (el.textContent || "").replace(/\\s+/g, " ").trim();
+              return text.slice(0, 120);
+            };
+            const getType = (el) => {
+              const role = (el.getAttribute("role") || "").toLowerCase();
+              if (role) return role;
+              const tag = el.tagName.toLowerCase();
+              if (tag === "input") {
+                const inputType = (el.getAttribute("type") || "text").toLowerCase();
+                if (inputType === "checkbox") return "checkbox";
+                if (inputType === "radio") return "radio";
+                if (inputType === "search") return "searchbox";
+                return "textbox";
+              }
+              if (tag === "textarea") return "textbox";
+              if (tag === "a") return "link";
+              return tag;
+            };
+            const selectors = ["input", "textarea", "select", "button", "a[href]", "[role='button']", "[role='link']", "[contenteditable='true']"];
+            const elements = Array.from(document.querySelectorAll(selectors.join(",")));
+            const seen = new Set();
+            const tree = [];
+            for (const el of elements) {
+              if (!(el instanceof Element)) continue;
+              const path = buildPath(el);
+              if (!path || seen.has(path)) continue;
+              seen.add(path);
+              const node = { ref: "ref_" + refHash(path), type: getType(el) };
+              const name = getName(el);
+              if (name) node.name = name;
+              if (el instanceof HTMLInputElement) {
+                if (el.type) node.inputType = el.type;
+                if (el.placeholder) node.placeholder = el.placeholder;
+                node.value = el.value ?? "";
+              }
+              if (el instanceof HTMLTextAreaElement) {
+                if (el.placeholder) node.placeholder = el.placeholder;
+                node.value = el.value ?? "";
+              }
+              if (el instanceof HTMLSelectElement) {
+                node.value = el.value;
+                node.options = Array.from(el.options).map((o) => o.text);
+              }
+              if ("disabled" in el) node.disabled = !!el.disabled;
+              tree.push(node);
+              if (tree.length >= 200) break;
+            }
+            return {
+              tree,
+              meta: {
+                fallback: true,
+                reason: "empty_tree_secondary_scan",
+                url: window.location.href,
+                title: document.title || "",
+                readyState: document.readyState,
+              },
+            };
+          })()`,
+          awaitPromise: true,
+          returnByValue: true,
+          allowUnsafeEvalBlockedByCSP: true,
+        })) as { result?: { value?: unknown } };
+        const fallbackValue = fallbackExtraction.result?.value;
+        if (fallbackValue) {
+          payload = fallbackValue;
+        }
+      }
+
       const serialized = JSON.stringify(payload);
       if (serialized.length > maxChars) {
         return JSON.stringify({
@@ -2476,179 +3037,202 @@ const formInputTool = tool(
       });
     }
 
-    try {
+    return withTabActionLock(tabId, async () => {
       try {
-        await ensureConsoleMonitor(tabId);
-      } catch {
-        // Best effort only; form input should still work if monitor installation fails.
-      }
+        try {
+          await ensureConsoleMonitor(tabId);
+        } catch {
+          // Best effort only; form input should still work if monitor installation fails.
+        }
 
-      const [injection] = await chrome.scripting.executeScript({
-        target: { tabId },
-        args: [ref, value],
-        func: (targetRef: string, nextValue: string | boolean | number) => {
-          const refHash = (input: string) => {
-            let hash = 0;
-            for (let i = 0; i < input.length; i += 1) {
-              hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
-            }
-            return Math.abs(hash).toString(36);
-          };
+        const payload = await withDebuggerSession(tabId, async (debuggee) => {
+          await chrome.debugger.sendCommand(debuggee, "Runtime.enable");
+          const evaluation = (await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+            expression: `(() => {
+              const targetRef = ${JSON.stringify(ref)};
+              const nextValue = ${JSON.stringify(value)};
 
-          const getRef = (path: string) => `ref_${refHash(path)}`;
+              const refHash = (input) => {
+                let hash = 0;
+                for (let i = 0; i < input.length; i += 1) {
+                  hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+                }
+                return Math.abs(hash).toString(36);
+              };
 
-          const root = document.documentElement || document.body;
-          if (!root) {
-            return {
-              success: false,
-              action: "form_input",
-              ref: targetRef,
-              error: "No document root found.",
-            };
-          }
+              const getRef = (path) => "ref_" + refHash(path);
+              const root = document.documentElement || document.body;
+              if (!root) {
+                return {
+                  success: false,
+                  action: "form_input",
+                  ref: targetRef,
+                  error: "No document root found.",
+                };
+              }
 
-          const findByRef = (el: Element, path: string): Element | null => {
-            if (getRef(path) === targetRef) return el;
+              const findByRef = (el, path) => {
+                if (!(el instanceof Element)) return null;
+                if (getRef(path) === targetRef) return el;
+                const children = Array.from(el.children);
+                for (let i = 0; i < children.length; i += 1) {
+                  const child = children[i];
+                  const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+                  const found = findByRef(child, childPath);
+                  if (found) return found;
+                }
+                return null;
+              };
 
-            const children = Array.from(el.children);
-            for (let i = 0; i < children.length; i += 1) {
-              const child = children[i];
-              const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
-              const found = findByRef(child, childPath);
-              if (found) return found;
-            }
-            return null;
-          };
+              const target = findByRef(root, root.tagName.toLowerCase() + ":0");
+              if (!target) {
+                return {
+                  success: false,
+                  action: "form_input",
+                  ref: targetRef,
+                  error: "Element reference not found. Use read_page or find again to refresh refs.",
+                };
+              }
 
-          const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
-          if (!target) {
-            return {
-              success: false,
-              action: "form_input",
-              ref: targetRef,
-              error: "Element reference not found. Use read_page or find again to refresh refs.",
-            };
-          }
+              const fireValueEvents = (el) => {
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+              };
 
-          const fireValueEvents = (el: Element) => {
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-          };
+              const toBoolean = (input) => {
+                if (typeof input === "boolean") return input;
+                if (typeof input === "number") return input !== 0;
+                if (typeof input === "string") {
+                  const lowered = input.trim().toLowerCase();
+                  if (["true", "1", "yes", "on"].includes(lowered)) return true;
+                  if (["false", "0", "no", "off", ""].includes(lowered)) return false;
+                }
+                return Boolean(input);
+              };
 
-          const toBoolean = (input: unknown) => {
-            if (typeof input === "boolean") return input;
-            if (typeof input === "number") return input !== 0;
-            if (typeof input === "string") {
-              const lowered = input.trim().toLowerCase();
-              if (["true", "1", "yes", "on"].includes(lowered)) return true;
-              if (["false", "0", "no", "off", ""].includes(lowered)) return false;
-            }
-            return Boolean(input);
-          };
+              if (target instanceof HTMLInputElement) {
+                const inputType = (target.type || "text").toLowerCase();
+                if (inputType === "checkbox" || inputType === "radio") {
+                  target.checked = toBoolean(nextValue);
+                } else {
+                  target.value = String(nextValue ?? "");
+                }
+                fireValueEvents(target);
+                return {
+                  success: true,
+                  action: "form_input",
+                  ref: targetRef,
+                  elementType: "input",
+                  inputType,
+                  value: inputType === "checkbox" || inputType === "radio" ? target.checked : target.value,
+                };
+              }
 
-          if (target instanceof HTMLInputElement) {
-            const inputType = (target.type || "text").toLowerCase();
-            if (inputType === "checkbox" || inputType === "radio") {
-              target.checked = toBoolean(nextValue);
-            } else {
-              target.value = String(nextValue ?? "");
-            }
-            fireValueEvents(target);
-            return {
-              success: true,
-              action: "form_input",
-              ref: targetRef,
-              elementType: "input",
-              inputType,
-              value: inputType === "checkbox" || inputType === "radio" ? target.checked : target.value,
-            };
-          }
+              if (target instanceof HTMLTextAreaElement) {
+                target.value = String(nextValue ?? "");
+                fireValueEvents(target);
+                return {
+                  success: true,
+                  action: "form_input",
+                  ref: targetRef,
+                  elementType: "textarea",
+                  value: target.value,
+                };
+              }
 
-          if (target instanceof HTMLTextAreaElement) {
-            target.value = String(nextValue ?? "");
-            fireValueEvents(target);
-            return {
-              success: true,
-              action: "form_input",
-              ref: targetRef,
-              elementType: "textarea",
-              value: target.value,
-            };
-          }
+              if (target instanceof HTMLSelectElement) {
+                const needle = String(nextValue ?? "").trim();
+                const options = Array.from(target.options);
+                const exactValue = options.find((o) => o.value === needle);
+                const exactText = options.find((o) => o.text.trim() === needle);
+                const ciText = options.find((o) => o.text.trim().toLowerCase() === needle.toLowerCase());
+                const matched = exactValue ?? exactText ?? ciText ?? null;
+                if (!matched) {
+                  return {
+                    success: false,
+                    action: "form_input",
+                    ref: targetRef,
+                    error: "No matching select option by value or text.",
+                    availableOptions: options.map((o) => ({ value: o.value, text: o.text })),
+                  };
+                }
+                target.value = matched.value;
+                fireValueEvents(target);
+                return {
+                  success: true,
+                  action: "form_input",
+                  ref: targetRef,
+                  elementType: "select",
+                  value: target.value,
+                  selectedText: matched.text,
+                };
+              }
 
-          if (target instanceof HTMLSelectElement) {
-            const needle = String(nextValue ?? "").trim();
-            const options = Array.from(target.options);
-            const exactValue = options.find((o) => o.value === needle);
-            const exactText = options.find((o) => o.text.trim() === needle);
-            const ciText = options.find((o) => o.text.trim().toLowerCase() === needle.toLowerCase());
-            const matched = exactValue ?? exactText ?? ciText ?? null;
-            if (!matched) {
+              if (target instanceof HTMLElement && target.isContentEditable) {
+                target.textContent = String(nextValue ?? "");
+                fireValueEvents(target);
+                return {
+                  success: true,
+                  action: "form_input",
+                  ref: targetRef,
+                  elementType: "contenteditable",
+                  value: target.textContent ?? "",
+                };
+              }
+
               return {
                 success: false,
                 action: "form_input",
                 ref: targetRef,
-                error: "No matching select option by value or text.",
-                availableOptions: options.map((o) => ({ value: o.value, text: o.text })),
+                error: "Referenced element is not a supported form input type.",
+                tagName: target.tagName.toLowerCase(),
               };
-            }
-            target.value = matched.value;
-            fireValueEvents(target);
-            return {
-              success: true,
-              action: "form_input",
-              ref: targetRef,
-              elementType: "select",
-              value: target.value,
-              selectedText: matched.text,
-            };
-          }
-
-          if (target instanceof HTMLElement && target.isContentEditable) {
-            target.textContent = String(nextValue ?? "");
-            fireValueEvents(target);
-            return {
-              success: true,
-              action: "form_input",
-              ref: targetRef,
-              elementType: "contenteditable",
-              value: target.textContent ?? "",
-            };
-          }
-
-          return {
-            success: false,
-            action: "form_input",
-            ref: targetRef,
-            error: "Referenced element is not a supported form input type.",
-            tagName: target.tagName.toLowerCase(),
+            })()`,
+            awaitPromise: true,
+            returnByValue: true,
+            allowUnsafeEvalBlockedByCSP: true,
+          })) as {
+            result?: { value?: unknown };
+            exceptionDetails?: { text?: string; exception?: { description?: string } };
           };
-        },
-      });
 
-      const payload =
-        injection?.result ??
-        ({
+          if (evaluation.exceptionDetails) {
+            const message =
+              evaluation.exceptionDetails.exception?.description ||
+              evaluation.exceptionDetails.text ||
+              "Unknown form_input error";
+            return {
+              success: false,
+              action: "form_input",
+              ref,
+              error: message,
+            };
+          }
+
+          return (
+            (evaluation.result?.value as Record<string, unknown> | undefined) ?? {
+              success: false,
+              action: "form_input",
+              ref,
+              error: "No result returned from page evaluation.",
+            }
+          );
+        });
+
+        return JSON.stringify({
+          ...(payload ?? {}),
+          tabId,
+        });
+      } catch (error) {
+        return JSON.stringify({
           success: false,
           action: "form_input",
           tabId,
           ref,
-          error: "No result returned from page evaluation.",
-        } as const);
-
-      return JSON.stringify({
-        ...((payload as Record<string, unknown>) ?? {}),
-        tabId,
-      });
-    } catch (error) {
-      return JSON.stringify({
-        success: false,
-        action: "form_input",
-        tabId,
-        ref,
-        error: String(error),
-      });
-    }
+          error: String(error),
+        });
+      }
+    });
   },
   {
     name: "form_input",
@@ -3957,6 +4541,7 @@ const tools = [
 const toolNode = new ToolNode(tools);
 const checkpointer = new MemorySaver();
 let fallbackSettings: LlmSettings | undefined;
+let fallbackAbortSignal: AbortSignal | undefined;
 
 function getTextContent(content: unknown): string {
   if (typeof content === "string") {
@@ -4000,6 +4585,32 @@ function getToolCallSummary(message: BaseMessage): string | null {
   }
 
   return `Calling tools: ${names.join(", ")}`;
+}
+
+function hasToolCalls(message: BaseMessage): boolean {
+  const maybeAi = message as unknown as {
+    tool_calls?: Array<{ name?: string }>;
+  };
+  return Array.isArray(maybeAi.tool_calls) && maybeAi.tool_calls.length > 0;
+}
+
+function countConsecutiveToolLoopMessages(messages: BaseMessage[], maxScan = 30): number {
+  let count = 0;
+  const start = Math.max(0, messages.length - maxScan);
+  for (let i = messages.length - 1; i >= start; i -= 1) {
+    const message = messages[i];
+    const type = getMessageType(message);
+    if (type === "tool") {
+      count += 1;
+      continue;
+    }
+    if (type === "ai" && hasToolCalls(message)) {
+      count += 1;
+      continue;
+    }
+    break;
+  }
+  return count;
 }
 
 function parseDirectCommand(input: string): ToolCall | null {
@@ -4274,17 +4885,29 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
     }
   }
 
+  const toolLoopDepth = countConsecutiveToolLoopMessages(state.messages as BaseMessage[]);
+  if (toolLoopDepth >= 30) {
+    return {
+      messages: [
+        new AIMessage(
+          "Stopping this run due to repeated tool calls without completion. Please retry with a clearer step-by-step request or a stronger model."
+        ),
+      ],
+    };
+  }
+
   const model = new ChatOpenAI({
     apiKey: settings.apiKey,
     model: settings.model,
-    temperature: 0.2,
+    // temperature: 0.2,
   }).bindTools(tools);
 
-  const response = await model.invoke([
-    new SystemMessage(
-        "You are a Chrome extension assistant. Use tool calling when actions are needed. " +
-        "Call tabs_context first when you need a valid tabId or when the user asks about available tabs. " +
-        "Call tabs_create to create a new tab in the current tab group/context. " +
+  const response = await model.invoke(
+    [
+      new SystemMessage(
+        "You are BayMax, a Chrome extension browser assistant. You help users by browsing, reading, and interacting with web pages. Use tool calling to take actions — never guess or assume browser state. Respond concisely: start with a brief description (3 to 5 words) of what you're doing, then take action. If no action is needed, respond conversationally without calling tools. " +
+        "Call tabs_context to get the current browser state (open tabs, active tab URL/title) BEFORE performing any tab-related action or when you need to know what tabs are open. Always call this first when the user references 'this page', 'current tab', 'my tabs', or any context-dependent request. Never assume tab state — always verify with tabs_context. " +
+        "Call tabs_create to open a new tab when the user wants to visit a URL, search the web, or navigate to a site. Provide the full URL (e.g., 'https://google.com'). For search queries, use 'https://www.google.com/search?q=<encoded_query>'. Do NOT create duplicate tabs — call tabs_context first to check if the target URL is already open, and switch to it instead if so. " +
         "Call read_page with tabId and optional depth/filter/max_chars/ref_id to inspect page structure and get ref IDs. " +
         "Call find with tabId and a natural language query to locate matching elements quickly. " +
         "Call form_input with tabId, ref, and value to set form fields (including inputs, selects, and textareas). " +
@@ -4297,11 +4920,14 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +
         "Call javascript_tool with action='javascript_exec', text, and tabId when user asks to run JavaScript on a page. " +
-        "Call turn_answer_start immediately before your final user-facing response in every turn. " +
         "For page location use window.location.href. Prefer scripts that return a value."
-    ),
-    ...state.messages,
-  ]);
+      ),
+      ...state.messages,
+    ],
+    {
+      signal: fallbackAbortSignal,
+    }
+  );
 
   return { messages: [response] };
 };
@@ -4366,7 +4992,8 @@ export async function runGraphTurn(
   input: string,
   settings: LlmSettings,
   seed?: PersistedThreadState,
-  onProgress?: (message: PersistedMessage) => void
+  onProgress?: (message: PersistedMessage) => void,
+  abortSignal?: AbortSignal
 ) {
   const threadConfig = {
     configurable: {
@@ -4395,6 +5022,7 @@ export async function runGraphTurn(
 
   let state: Awaited<ReturnType<typeof graph.invoke>> | null = null;
   fallbackSettings = settings;
+  fallbackAbortSignal = abortSignal;
   try {
     const stream = (await graph.stream(
       {
@@ -4403,11 +5031,18 @@ export async function runGraphTurn(
       {
         ...threadConfig,
         streamMode: "values",
+        signal: abortSignal,
+        recursionLimit: 40,
       }
     )) as AsyncIterable<{ messages?: BaseMessage[] }>;
 
     const emittedMessageIds = new Set<string>();
     for await (const chunk of stream) {
+      if (abortSignal?.aborted) {
+        const abortError = new Error("Request cancelled.");
+        abortError.name = "AbortError";
+        throw abortError;
+      }
       const streamMessages = chunk.messages;
       if (!streamMessages || !Array.isArray(streamMessages)) {
         continue;
@@ -4437,14 +5072,24 @@ export async function runGraphTurn(
     }
   } finally {
     fallbackSettings = undefined;
+    fallbackAbortSignal = undefined;
   }
 
   if (!state) {
+    if (abortSignal?.aborted) {
+      const abortError = new Error("Request cancelled.");
+      abortError.name = "AbortError";
+      throw abortError;
+    }
     state = await graph.invoke(
       {
         messages: [...seedMessages, new HumanMessage(input)],
       },
-      threadConfig
+      {
+        ...threadConfig,
+        signal: abortSignal,
+        recursionLimit: 40,
+      }
     );
   }
 

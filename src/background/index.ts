@@ -7,7 +7,15 @@ type RunGraphRequest = {
   requestId?: string;
 };
 
+type CancelGraphRequest = {
+  type: "CANCEL_GRAPH";
+  requestId: string;
+};
+
+type GraphRequest = RunGraphRequest | CancelGraphRequest;
+
 const THREAD_PREFIX = "thread:";
+const activeRuns = new Map<string, AbortController>();
 
 function keyForThread(threadId: string) {
   return `${THREAD_PREFIX}${threadId}`;
@@ -53,17 +61,43 @@ chrome.action.onClicked.addListener(async (tab) => {
   await Promise.allSettled([chrome.sidePanel.open({ tabId: tab.id }), ensureClawTabGroup(tab)]);
 });
 
-chrome.runtime.onMessage.addListener((message: RunGraphRequest, _sender, sendResponse) => {
+function isAbortError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const lowered = error.message.toLowerCase();
+  return error.name === "AbortError" || lowered.includes("aborted") || lowered.includes("cancel");
+}
+
+chrome.runtime.onMessage.addListener((message: GraphRequest, _sender, sendResponse) => {
+  if (message.type === "CANCEL_GRAPH") {
+    const controller = activeRuns.get(message.requestId);
+    if (controller) {
+      controller.abort();
+      activeRuns.delete(message.requestId);
+      sendResponse({ ok: true, cancelled: true });
+      return;
+    }
+    sendResponse({ ok: true, cancelled: false });
+    return;
+  }
+
   if (message.type !== "RUN_GRAPH") {
     return;
   }
 
   (async () => {
+    let controller: AbortController | undefined;
     try {
       const llmSettings = await loadLlmSettings();
       if (!llmSettings) {
         sendResponse({ ok: false, error: "Open Options and save OpenAI API key + model first." });
         return;
+      }
+
+      if (message.requestId) {
+        controller = new AbortController();
+        activeRuns.set(message.requestId, controller);
       }
 
       const seed = await loadThreadState(message.threadId);
@@ -86,12 +120,21 @@ chrome.runtime.onMessage.addListener((message: RunGraphRequest, _sender, sendRes
             .catch(() => {
               // Ignore if there is no active sidepanel listener.
             });
-        }
+        },
+        controller?.signal
       );
       await saveThreadState(message.threadId, result.state);
       sendResponse({ ok: true, ...result });
     } catch (error) {
+      if (isAbortError(error)) {
+        sendResponse({ ok: false, cancelled: true, error: "Request cancelled." });
+        return;
+      }
       sendResponse({ ok: false, error: (error as Error).message });
+    } finally {
+      if (message.requestId) {
+        activeRuns.delete(message.requestId);
+      }
     }
   })();
 

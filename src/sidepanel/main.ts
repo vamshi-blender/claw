@@ -9,6 +9,7 @@ type GraphResponse = {
     }>;
     lastToolResult: string | null;
   };
+  cancelled?: boolean;
   error?: string;
 };
 
@@ -49,6 +50,11 @@ if (
 }
 
 let activeRequestId: string | null = null;
+
+function setRunState(isRunning: boolean) {
+  runButton.disabled = false;
+  runButton.textContent = isRunning ? "Stop" : "Send";
+}
 
 function setDebugPanelVisible(visible: boolean) {
   debugPanel.classList.toggle("hidden", !visible);
@@ -103,6 +109,11 @@ function setPendingUserMessage(input: string) {
 }
 
 async function runGraph() {
+  if (activeRequestId) {
+    await stopGraph();
+    return;
+  }
+
   const threadId = threadInput.value.trim() || "default-thread";
   const input = promptInput.value.trim();
 
@@ -111,30 +122,66 @@ async function runGraph() {
   }
 
   setPendingUserMessage(input);
-  runButton.disabled = true;
   const requestId = crypto.randomUUID();
   activeRequestId = requestId;
-
-  const response = (await chrome.runtime.sendMessage({
-    type: "RUN_GRAPH",
-    requestId,
-    threadId,
-    input,
-  })) as GraphResponse;
-
-  if (!response.ok) {
-    appendAssistantBubble(`Error: ${response.error ?? "Unknown error"}`);
-    runButton.disabled = false;
-    activeRequestId = null;
-    return;
-  }
-
-  renderMessages(response.state?.messages ?? []);
-  memoryOutput.textContent = JSON.stringify(response.state, null, 2);
-  runButton.disabled = false;
+  setRunState(true);
   promptInput.value = "";
   promptInput.style.height = "40px";
-  activeRequestId = null;
+
+  try {
+    const response = (await chrome.runtime.sendMessage({
+      type: "RUN_GRAPH",
+      requestId,
+      threadId,
+      input,
+    })) as GraphResponse;
+
+    if (activeRequestId !== requestId) {
+      return;
+    }
+
+    if (!response.ok) {
+      if (!response.cancelled) {
+        appendAssistantBubble(`Error: ${response.error ?? "Unknown error"}`);
+      }
+      activeRequestId = null;
+      setRunState(false);
+      return;
+    }
+
+    renderMessages(response.state?.messages ?? []);
+    memoryOutput.textContent = JSON.stringify(response.state, null, 2);
+    activeRequestId = null;
+    setRunState(false);
+  } catch (error) {
+    if (activeRequestId === requestId) {
+      appendAssistantBubble(`Error: ${(error as Error).message ?? "Failed to send request"}`);
+      activeRequestId = null;
+      setRunState(false);
+    }
+  }
+}
+
+async function stopGraph() {
+  if (!activeRequestId) {
+    return;
+  }
+  const requestId = activeRequestId;
+  runButton.disabled = true;
+  runButton.textContent = "Stopping...";
+  try {
+    await chrome.runtime.sendMessage({
+      type: "CANCEL_GRAPH",
+      requestId,
+    });
+  } catch {
+    // Ignore if background page is not reachable momentarily.
+  } finally {
+    runButton.disabled = false;
+    if (activeRequestId === requestId) {
+      runButton.textContent = "Stop";
+    }
+  }
 }
 
 runButton.addEventListener("click", () => {
@@ -185,3 +232,4 @@ newThreadButton.addEventListener("click", () => {
 
 setDebugPanelVisible(false);
 renderMessages([]);
+setRunState(false);
