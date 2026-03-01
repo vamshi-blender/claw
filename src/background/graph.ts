@@ -1409,6 +1409,241 @@ async function getElementMetadataByRef(tabId: number, ref: string) {
   );
 }
 
+type RefValueSnapshot =
+  | {
+      success: true;
+      ref: string;
+      elementType: "input";
+      inputType: string;
+      value: string | boolean;
+    }
+  | {
+      success: true;
+      ref: string;
+      elementType: "textarea" | "select" | "contenteditable";
+      value: string;
+    }
+  | { success: false; ref: string; error: string };
+
+async function readFormValueByRef(tabId: number, ref: string): Promise<RefValueSnapshot> {
+  try {
+    const result = await evaluateTabWithDebugger<RefValueSnapshot>(
+      tabId,
+      `(() => {
+        const targetRef = ${JSON.stringify(ref)};
+        const refHash = (input) => {
+          let hash = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+          }
+          return Math.abs(hash).toString(36);
+        };
+
+        const getRef = (path) => "ref_" + refHash(path);
+        const root = document.documentElement || document.body;
+        if (!root) return { success: false, ref: targetRef, error: "No document root found." };
+
+        const findByRef = (el, path) => {
+          if (!(el instanceof Element)) return null;
+          if (getRef(path) === targetRef) return el;
+          const children = Array.from(el.children);
+          for (let i = 0; i < children.length; i += 1) {
+            const child = children[i];
+            const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+            const found = findByRef(child, childPath);
+            if (found) return found;
+          }
+          return null;
+        };
+
+        const target = findByRef(root, root.tagName.toLowerCase() + ":0");
+        if (!target) return { success: false, ref: targetRef, error: "Element reference not found." };
+
+        if (target instanceof HTMLInputElement) {
+          const inputType = (target.type || "text").toLowerCase();
+          if (inputType === "checkbox" || inputType === "radio") {
+            return { success: true, ref: targetRef, elementType: "input", inputType, value: target.checked };
+          }
+          return { success: true, ref: targetRef, elementType: "input", inputType, value: target.value ?? "" };
+        }
+        if (target instanceof HTMLTextAreaElement) {
+          return { success: true, ref: targetRef, elementType: "textarea", value: target.value ?? "" };
+        }
+        if (target instanceof HTMLSelectElement) {
+          return { success: true, ref: targetRef, elementType: "select", value: target.value ?? "" };
+        }
+        if (target instanceof HTMLElement && target.isContentEditable) {
+          return { success: true, ref: targetRef, elementType: "contenteditable", value: target.textContent ?? "" };
+        }
+        return { success: false, ref: targetRef, error: "Unsupported element type: " + target.tagName.toLowerCase() };
+      })()`
+    );
+    return (
+      result ?? {
+        success: false,
+        ref,
+        error: "Failed to verify element value by ref.",
+      }
+    );
+  } catch (error) {
+    return {
+      success: false,
+      ref,
+      error: String(error),
+    };
+  }
+}
+
+async function verifyCoordinateMatchesRef(
+  tabId: number,
+  targetRef: string,
+  coordinate: [number, number]
+): Promise<{
+  ok: boolean;
+  relation?: "exact" | "descendant" | "ancestor" | "none";
+  clickedRef?: string;
+  error?: string;
+}> {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [targetRef, coordinate[0], coordinate[1]],
+      func: (requestedRef: string, x: number, y: number) => {
+        const refHash = (input: string) => {
+          let hash = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+          }
+          return Math.abs(hash).toString(36);
+        };
+
+        const getRef = (path: string) => `ref_${refHash(path)}`;
+        const buildPath = (el: Element) => {
+          const segments: string[] = [];
+          let current: Element | null = el;
+          while (current) {
+            const parent = current.parentElement;
+            const index = parent ? Array.from(parent.children).indexOf(current) : 0;
+            segments.push(`${current.tagName.toLowerCase()}:${Math.max(index, 0)}`);
+            if (!parent) break;
+            current = parent;
+          }
+          return segments.reverse().join(">");
+        };
+
+        const root = document.documentElement || document.body;
+        if (!root) {
+          return { ok: false as const, relation: "none" as const, error: "No document root found." };
+        }
+
+        const findByRef = (el: Element, path: string): Element | null => {
+          if (getRef(path) === requestedRef) return el;
+          const children = Array.from(el.children);
+          for (let i = 0; i < children.length; i += 1) {
+            const child = children[i];
+            const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+            const found = findByRef(child, childPath);
+            if (found) return found;
+          }
+          return null;
+        };
+
+        const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+        const clicked = document.elementFromPoint(x, y);
+        if (!target || !clicked) {
+          return {
+            ok: false as const,
+            relation: "none" as const,
+            ...(clicked ? { clickedRef: getRef(buildPath(clicked)) } : {}),
+          };
+        }
+
+        const clickedRef = getRef(buildPath(clicked));
+        if (target === clicked) {
+          return { ok: true as const, relation: "exact" as const, clickedRef };
+        }
+        if (target.contains(clicked)) {
+          return { ok: true as const, relation: "descendant" as const, clickedRef };
+        }
+        if (clicked.contains(target)) {
+          return { ok: true as const, relation: "ancestor" as const, clickedRef };
+        }
+        return { ok: false as const, relation: "none" as const, clickedRef };
+      },
+    });
+
+    return (
+      (injection?.result as
+        | { ok: boolean; relation?: "exact" | "descendant" | "ancestor" | "none"; clickedRef?: string; error?: string }
+        | undefined) ?? { ok: false, relation: "none", error: "No verification result." }
+    );
+  } catch (error) {
+    return { ok: false, relation: "none", error: String(error) };
+  }
+}
+
+async function inspectSubmitOutcome(tabId: number) {
+  try {
+    const result = await evaluateTabWithDebugger<{
+      url: string;
+      title: string;
+      readyState: string;
+      hasForm: boolean;
+      matchedSuccessHints: string[];
+    }>(
+      tabId,
+      `(() => {
+        const text = (document.body?.innerText || "").replace(/\\s+/g, " ").trim().toLowerCase();
+        const hasForm = Boolean(document.querySelector("form"));
+        const successHints = ["application submitted", "submitted successfully", "thank you for applying", "success"];
+        const matchedHints = successHints.filter((hint) => text.includes(hint));
+        return {
+          url: window.location.href,
+          title: document.title || "",
+          readyState: document.readyState,
+          hasForm,
+          matchedSuccessHints: matchedHints,
+        };
+      })()`
+    );
+    return (
+      result ?? {
+        url: "",
+        title: "",
+        readyState: "unknown",
+        hasForm: false,
+        matchedSuccessHints: [],
+      }
+    );
+  } catch {
+    return {
+      url: "",
+      title: "",
+      readyState: "unknown",
+      hasForm: false,
+      matchedSuccessHints: [],
+    };
+  }
+}
+
+async function getPageLocation(tabId: number): Promise<{ url: string; title: string } | null> {
+  try {
+    const result = await evaluateTabWithDebugger<{ url: string; title: string }>(
+      tabId,
+      `(() => ({ url: window.location.href, title: document.title || "" }))()`
+    );
+    if (!result || typeof result.url !== "string") {
+      return null;
+    }
+    return {
+      url: result.url,
+      title: typeof result.title === "string" ? result.title : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
 type ConsoleCapturedMessage = {
   type: string;
   message: string;
@@ -3025,7 +3260,7 @@ const findTool = tool(
 );
 
 const formInputTool = tool(
-  async ({ ref, value, tabId }) => {
+  async ({ ref, value, tabId, inputs }) => {
     const scope = await validateTabInCurrentScope(tabId);
     if (!scope.ok) {
       return JSON.stringify({
@@ -3045,183 +3280,285 @@ const formInputTool = tool(
           // Best effort only; form input should still work if monitor installation fails.
         }
 
-        const payload = await withDebuggerSession(tabId, async (debuggee) => {
-          await chrome.debugger.sendCommand(debuggee, "Runtime.enable");
-          const evaluation = (await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
-            expression: `(() => {
-              const targetRef = ${JSON.stringify(ref)};
-              const nextValue = ${JSON.stringify(value)};
+        const normalizedInputs =
+          Array.isArray(inputs) && inputs.length > 0
+            ? inputs
+            : ref !== undefined && value !== undefined
+              ? [{ ref, value }]
+              : [];
 
-              const refHash = (input) => {
-                let hash = 0;
-                for (let i = 0; i < input.length; i += 1) {
-                  hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
-                }
-                return Math.abs(hash).toString(36);
-              };
+        if (normalizedInputs.length === 0) {
+          return JSON.stringify({
+            success: false,
+            action: "form_input",
+            tabId,
+            error: "Provide either (ref and value) or non-empty inputs array.",
+          });
+        }
 
-              const getRef = (path) => "ref_" + refHash(path);
-              const root = document.documentElement || document.body;
-              if (!root) {
-                return {
-                  success: false,
-                  action: "form_input",
-                  ref: targetRef,
-                  error: "No document root found.",
+        const applySingleInput = async (targetRef: string, nextValue: string | boolean | number) => {
+          const payload = await withDebuggerSession(tabId, async (debuggee) => {
+            await chrome.debugger.sendCommand(debuggee, "Runtime.enable");
+            const evaluation = (await chrome.debugger.sendCommand(debuggee, "Runtime.evaluate", {
+              expression: `(() => {
+                const targetRef = ${JSON.stringify(targetRef)};
+                const nextValue = ${JSON.stringify(nextValue)};
+
+                const refHash = (input) => {
+                  let hash = 0;
+                  for (let i = 0; i < input.length; i += 1) {
+                    hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+                  }
+                  return Math.abs(hash).toString(36);
                 };
-              }
 
-              const findByRef = (el, path) => {
-                if (!(el instanceof Element)) return null;
-                if (getRef(path) === targetRef) return el;
-                const children = Array.from(el.children);
-                for (let i = 0; i < children.length; i += 1) {
-                  const child = children[i];
-                  const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
-                  const found = findByRef(child, childPath);
-                  if (found) return found;
-                }
-                return null;
-              };
-
-              const target = findByRef(root, root.tagName.toLowerCase() + ":0");
-              if (!target) {
-                return {
-                  success: false,
-                  action: "form_input",
-                  ref: targetRef,
-                  error: "Element reference not found. Use read_page or find again to refresh refs.",
-                };
-              }
-
-              const fireValueEvents = (el) => {
-                el.dispatchEvent(new Event("input", { bubbles: true }));
-                el.dispatchEvent(new Event("change", { bubbles: true }));
-              };
-
-              const toBoolean = (input) => {
-                if (typeof input === "boolean") return input;
-                if (typeof input === "number") return input !== 0;
-                if (typeof input === "string") {
-                  const lowered = input.trim().toLowerCase();
-                  if (["true", "1", "yes", "on"].includes(lowered)) return true;
-                  if (["false", "0", "no", "off", ""].includes(lowered)) return false;
-                }
-                return Boolean(input);
-              };
-
-              if (target instanceof HTMLInputElement) {
-                const inputType = (target.type || "text").toLowerCase();
-                if (inputType === "checkbox" || inputType === "radio") {
-                  target.checked = toBoolean(nextValue);
-                } else {
-                  target.value = String(nextValue ?? "");
-                }
-                fireValueEvents(target);
-                return {
-                  success: true,
-                  action: "form_input",
-                  ref: targetRef,
-                  elementType: "input",
-                  inputType,
-                  value: inputType === "checkbox" || inputType === "radio" ? target.checked : target.value,
-                };
-              }
-
-              if (target instanceof HTMLTextAreaElement) {
-                target.value = String(nextValue ?? "");
-                fireValueEvents(target);
-                return {
-                  success: true,
-                  action: "form_input",
-                  ref: targetRef,
-                  elementType: "textarea",
-                  value: target.value,
-                };
-              }
-
-              if (target instanceof HTMLSelectElement) {
-                const needle = String(nextValue ?? "").trim();
-                const options = Array.from(target.options);
-                const exactValue = options.find((o) => o.value === needle);
-                const exactText = options.find((o) => o.text.trim() === needle);
-                const ciText = options.find((o) => o.text.trim().toLowerCase() === needle.toLowerCase());
-                const matched = exactValue ?? exactText ?? ciText ?? null;
-                if (!matched) {
+                const getRef = (path) => "ref_" + refHash(path);
+                const root = document.documentElement || document.body;
+                if (!root) {
                   return {
                     success: false,
                     action: "form_input",
                     ref: targetRef,
-                    error: "No matching select option by value or text.",
-                    availableOptions: options.map((o) => ({ value: o.value, text: o.text })),
+                    error: "No document root found.",
                   };
                 }
-                target.value = matched.value;
-                fireValueEvents(target);
+
+                const findByRef = (el, path) => {
+                  if (!(el instanceof Element)) return null;
+                  if (getRef(path) === targetRef) return el;
+                  const children = Array.from(el.children);
+                  for (let i = 0; i < children.length; i += 1) {
+                    const child = children[i];
+                    const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+                    const found = findByRef(child, childPath);
+                    if (found) return found;
+                  }
+                  return null;
+                };
+
+                const target = findByRef(root, root.tagName.toLowerCase() + ":0");
+                if (!target) {
+                  return {
+                    success: false,
+                    action: "form_input",
+                    ref: targetRef,
+                    error: "Element reference not found. Use read_page or find again to refresh refs.",
+                  };
+                }
+
+                const fireValueEvents = (el) => {
+                  el.dispatchEvent(new Event("input", { bubbles: true }));
+                  el.dispatchEvent(new Event("change", { bubbles: true }));
+                };
+
+                const toBoolean = (input) => {
+                  if (typeof input === "boolean") return input;
+                  if (typeof input === "number") return input !== 0;
+                  if (typeof input === "string") {
+                    const lowered = input.trim().toLowerCase();
+                    if (["true", "1", "yes", "on"].includes(lowered)) return true;
+                    if (["false", "0", "no", "off", ""].includes(lowered)) return false;
+                  }
+                  return Boolean(input);
+                };
+
+                if (target instanceof HTMLInputElement) {
+                  const inputType = (target.type || "text").toLowerCase();
+                  if (inputType === "checkbox" || inputType === "radio") {
+                    target.checked = toBoolean(nextValue);
+                  } else {
+                    target.value = String(nextValue ?? "");
+                  }
+                  fireValueEvents(target);
+                  return {
+                    success: true,
+                    action: "form_input",
+                    ref: targetRef,
+                    elementType: "input",
+                    inputType,
+                    value: inputType === "checkbox" || inputType === "radio" ? target.checked : target.value,
+                  };
+                }
+
+                if (target instanceof HTMLTextAreaElement) {
+                  target.value = String(nextValue ?? "");
+                  fireValueEvents(target);
+                  return {
+                    success: true,
+                    action: "form_input",
+                    ref: targetRef,
+                    elementType: "textarea",
+                    value: target.value,
+                  };
+                }
+
+                if (target instanceof HTMLSelectElement) {
+                  const needle = String(nextValue ?? "").trim();
+                  const options = Array.from(target.options);
+                  const exactValue = options.find((o) => o.value === needle);
+                  const exactText = options.find((o) => o.text.trim() === needle);
+                  const ciText = options.find((o) => o.text.trim().toLowerCase() === needle.toLowerCase());
+                  const matched = exactValue ?? exactText ?? ciText ?? null;
+                  if (!matched) {
+                    return {
+                      success: false,
+                      action: "form_input",
+                      ref: targetRef,
+                      error: "No matching select option by value or text.",
+                      availableOptions: options.map((o) => ({ value: o.value, text: o.text })),
+                    };
+                  }
+                  target.value = matched.value;
+                  fireValueEvents(target);
+                  return {
+                    success: true,
+                    action: "form_input",
+                    ref: targetRef,
+                    elementType: "select",
+                    value: target.value,
+                    selectedText: matched.text,
+                  };
+                }
+
+                if (target instanceof HTMLElement && target.isContentEditable) {
+                  target.textContent = String(nextValue ?? "");
+                  fireValueEvents(target);
+                  return {
+                    success: true,
+                    action: "form_input",
+                    ref: targetRef,
+                    elementType: "contenteditable",
+                    value: target.textContent ?? "",
+                  };
+                }
+
                 return {
-                  success: true,
+                  success: false,
                   action: "form_input",
                   ref: targetRef,
-                  elementType: "select",
-                  value: target.value,
-                  selectedText: matched.text,
+                  error: "Referenced element is not a supported form input type.",
+                  tagName: target.tagName.toLowerCase(),
                 };
-              }
+              })()`,
+              awaitPromise: true,
+              returnByValue: true,
+              allowUnsafeEvalBlockedByCSP: true,
+            })) as {
+              result?: { value?: unknown };
+              exceptionDetails?: { text?: string; exception?: { description?: string } };
+            };
 
-              if (target instanceof HTMLElement && target.isContentEditable) {
-                target.textContent = String(nextValue ?? "");
-                fireValueEvents(target);
-                return {
-                  success: true,
-                  action: "form_input",
-                  ref: targetRef,
-                  elementType: "contenteditable",
-                  value: target.textContent ?? "",
-                };
-              }
-
+            if (evaluation.exceptionDetails) {
+              const message =
+                evaluation.exceptionDetails.exception?.description ||
+                evaluation.exceptionDetails.text ||
+                "Unknown form_input error";
               return {
                 success: false,
                 action: "form_input",
                 ref: targetRef,
-                error: "Referenced element is not a supported form input type.",
-                tagName: target.tagName.toLowerCase(),
+                error: message,
               };
-            })()`,
-            awaitPromise: true,
-            returnByValue: true,
-            allowUnsafeEvalBlockedByCSP: true,
-          })) as {
-            result?: { value?: unknown };
-            exceptionDetails?: { text?: string; exception?: { description?: string } };
-          };
+            }
 
-          if (evaluation.exceptionDetails) {
-            const message =
-              evaluation.exceptionDetails.exception?.description ||
-              evaluation.exceptionDetails.text ||
-              "Unknown form_input error";
+            return (
+              (evaluation.result?.value as Record<string, unknown> | undefined) ?? {
+                success: false,
+                action: "form_input",
+                ref: targetRef,
+                error: "No result returned from page evaluation.",
+              }
+            );
+          });
+
+          const payloadRecord = (payload ?? {}) as Record<string, unknown>;
+          if (payloadRecord.success !== true) {
             return {
-              success: false,
-              action: "form_input",
-              ref,
-              error: message,
+              ...payloadRecord,
+              tabId,
             };
           }
 
-          return (
-            (evaluation.result?.value as Record<string, unknown> | undefined) ?? {
+          const verified = await readFormValueByRef(tabId, targetRef);
+          if (!verified.success) {
+            return {
               success: false,
               action: "form_input",
-              ref,
-              error: "No result returned from page evaluation.",
-            }
-          );
-        });
+              tabId,
+              ref: targetRef,
+              error: "Value write could not be verified.",
+              verification: verified,
+            };
+          }
 
+          const elementType = String(payloadRecord.elementType ?? "");
+          const inputType = String(payloadRecord.inputType ?? "").toLowerCase();
+          let expected: string | boolean;
+          if (elementType === "input" && (inputType === "checkbox" || inputType === "radio")) {
+            if (typeof nextValue === "boolean") {
+              expected = nextValue;
+            } else if (typeof nextValue === "number") {
+              expected = nextValue !== 0;
+            } else {
+              const lowered = String(nextValue).trim().toLowerCase();
+              expected = ["true", "1", "yes", "on"].includes(lowered);
+            }
+          } else if (elementType === "select") {
+            expected = String(payloadRecord.value ?? "");
+          } else {
+            expected = String(nextValue ?? "");
+          }
+
+          const actual = verified.value;
+          if (actual !== expected) {
+            return {
+              success: false,
+              action: "form_input",
+              tabId,
+              ref: targetRef,
+              error: "Value verification failed after input.",
+              expected,
+              actual,
+              verification: verified,
+            };
+          }
+
+          return {
+            ...payloadRecord,
+            tabId,
+            verified: true,
+            verification: {
+              ref: targetRef,
+              elementType: verified.elementType,
+              ...(verified.elementType === "input" ? { inputType: verified.inputType } : {}),
+              value: verified.value,
+            },
+          };
+        };
+
+        if (normalizedInputs.length === 1) {
+          const single = normalizedInputs[0] as { ref: string; value: string | boolean | number };
+          return JSON.stringify(await applySingleInput(single.ref, single.value));
+        }
+
+        const results: Array<Record<string, unknown>> = [];
+        for (const entry of normalizedInputs) {
+          const result = await applySingleInput(entry.ref, entry.value);
+          results.push(result);
+        }
+
+        const succeeded = results.filter((r) => r.success === true).length;
+        const failed = results.length - succeeded;
         return JSON.stringify({
-          ...(payload ?? {}),
+          success: failed === 0,
+          action: "form_input",
+          mode: "batch",
           tabId,
+          total: results.length,
+          succeeded,
+          failed,
+          ...(failed > 0 ? { error: `Batch completed with ${failed} failed updates.` } : {}),
+          results,
         });
       } catch (error) {
         return JSON.stringify({
@@ -3237,16 +3574,52 @@ const formInputTool = tool(
   {
     name: "form_input",
     description:
-      "Set values in form elements using a read_page/find ref. Requires ref, value (string|boolean|number), and tabId from tabs_context.",
-    schema: z.object({
-      ref: z.string().min(1).describe("Element reference ID from read_page tool (e.g., 'ref_1')."),
-      value: z
-        .union([z.string(), z.boolean(), z.number()])
-        .describe(
-          "Value to set. For checkboxes/radios prefer boolean; for selects use option value or visible text; for other inputs use string/number."
-        ),
-      tabId: z.number().int().describe("Tab ID to set form value in. Must be in current tab group/context."),
-    }),
+      "Set values in form elements using read_page/find refs. Supports either a single pair (ref, value) or batch mode via inputs array.",
+    schema: z
+      .object({
+        tabId: z.number().int().describe("Tab ID to set form value in. Must be in current tab group/context."),
+        ref: z.string().min(1).optional().describe("Single input ref from read_page/find (e.g., 'ref_1')."),
+        value: z
+          .union([z.string(), z.boolean(), z.number()])
+          .optional()
+          .describe(
+            "Single input value. For checkboxes/radios prefer boolean; for selects use option value or visible text."
+          ),
+        inputs: z
+          .array(
+            z.object({
+              ref: z.string().min(1).describe("Element ref from read_page/find."),
+              value: z.union([z.string(), z.boolean(), z.number()]).describe("Value to set for this ref."),
+            })
+          )
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Batch inputs to set in one call. Prefer this for multi-field forms."),
+      })
+      .superRefine((data, ctx) => {
+        const hasSingle = data.ref !== undefined || data.value !== undefined;
+        const hasBothSingle = data.ref !== undefined && data.value !== undefined;
+        const hasBatch = Array.isArray(data.inputs) && data.inputs.length > 0;
+        if (!hasBatch && !hasBothSingle) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Provide either both 'ref' and 'value' or a non-empty 'inputs' array.",
+          });
+        }
+        if (hasSingle && !hasBothSingle) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Single-input mode requires both 'ref' and 'value'.",
+          });
+        }
+        if (hasBatch && hasSingle) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Provide either single-input fields (ref/value) or batch inputs, not both.",
+          });
+        }
+      }),
   }
 );
 
@@ -3563,11 +3936,44 @@ const computerTool = tool(
 
           const clickCount = action === "double_click" ? 2 : action === "triple_click" ? 3 : 1;
           const button = action === "right_click" ? "right" : "left";
+          const locationBeforeClick = await getPageLocation(tabId);
           await withDebuggerSession(tabId, async (debuggee) => {
             await dispatchClick(debuggee, resolved.coordinate, button, clickCount, parsedModifiers.bitmask);
           });
+          const locationAfterClick = await getPageLocation(tabId);
 
           const clickInfo = await describeElementAtCoordinate(tabId, resolved.coordinate);
+          const navigatedAfterClick =
+            Boolean(locationBeforeClick?.url) &&
+            Boolean(locationAfterClick?.url) &&
+            locationBeforeClick?.url !== locationAfterClick?.url;
+          if (
+            resolved.fromRef &&
+            ref &&
+            clickInfo.element?.ref &&
+            clickInfo.element.ref !== ref
+          ) {
+            if (!navigatedAfterClick) {
+              const relationCheck = await verifyCoordinateMatchesRef(tabId, ref, resolved.coordinate);
+              const permissionBlocked =
+                typeof relationCheck.error === "string" &&
+                relationCheck.error.includes("Extension manifest must request permission");
+              if (!relationCheck.ok && !permissionBlocked) {
+                return fail("Click target verification failed: clicked element does not match requested ref.", {
+                  ref,
+                  clickedElement: clickInfo.element,
+                  verification: relationCheck,
+                });
+              }
+            }
+          }
+
+          const maybeSubmitClick =
+            action === "left_click" &&
+            resolved.fromRef &&
+            (resolved.element?.type === "button" ||
+              /submit|apply/i.test(String(resolved.element?.name ?? "")));
+          const submitOutcome = maybeSubmitClick ? await inspectSubmitOutcome(tabId) : null;
           return JSON.stringify({
             success: true,
             action,
@@ -3575,6 +3981,11 @@ const computerTool = tool(
             ...(resolved.fromRef ? { ref } : { coordinate: resolved.coordinate }),
             ...(parsedModifiers.normalized ? { modifiers: parsedModifiers.normalized } : {}),
             ...(clickInfo.element ? { clickedElement: clickInfo.element } : {}),
+            ...(resolved.element ? { requestedElement: resolved.element } : {}),
+            ...(locationBeforeClick ? { locationBeforeClick } : {}),
+            ...(locationAfterClick ? { locationAfterClick } : {}),
+            ...(navigatedAfterClick ? { navigationAfterClick: true } : {}),
+            ...(submitOutcome ? { submitOutcome } : {}),
             ...(action === "right_click" ? { contextMenuOpened: true } : {}),
           });
         }
@@ -4594,23 +5005,167 @@ function hasToolCalls(message: BaseMessage): boolean {
   return Array.isArray(maybeAi.tool_calls) && maybeAi.tool_calls.length > 0;
 }
 
-function countConsecutiveToolLoopMessages(messages: BaseMessage[], maxScan = 30): number {
-  let count = 0;
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  const objectValue = value as Record<string, unknown>;
+  const keys = Object.keys(objectValue).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(objectValue[key])}`).join(",")}}`;
+}
+
+function getSingleToolCallSignature(message: BaseMessage): string | null {
+  const maybeAi = message as unknown as {
+    tool_calls?: Array<{ name?: string; args?: Record<string, unknown> }>;
+  };
+  if (!Array.isArray(maybeAi.tool_calls) || maybeAi.tool_calls.length !== 1) {
+    return null;
+  }
+  const [call] = maybeAi.tool_calls;
+  if (!call?.name) {
+    return null;
+  }
+  return `${call.name}:${stableStringify(call.args ?? {})}`;
+}
+
+type ToolResultMeta = {
+  success?: boolean;
+  ref?: string;
+};
+
+function parseToolResultMeta(message: BaseMessage): ToolResultMeta {
+  try {
+    const raw = getTextContent(message.content);
+    const parsed = JSON.parse(raw) as {
+      success?: unknown;
+      ref?: unknown;
+      verification?: { ref?: unknown };
+    };
+    const ref =
+      typeof parsed.ref === "string"
+        ? parsed.ref
+        : typeof parsed.verification?.ref === "string"
+          ? parsed.verification.ref
+          : undefined;
+    return {
+      success: typeof parsed.success === "boolean" ? parsed.success : undefined,
+      ref,
+    };
+  } catch {
+    return {};
+  }
+}
+
+type ToolLoopAssessment = {
+  shouldStop: boolean;
+  reasonCode: "none" | "repeat_streak" | "failure_streak" | "low_diversity_churn" | "hard_cap";
+  totalToolCalls: number;
+  distinctSignatures: number;
+  longestRepeatStreak: number;
+  consecutiveFailures: number;
+  uniqueRefsTouched: number;
+};
+
+function assessToolLoop(messages: BaseMessage[], maxScan = 160): ToolLoopAssessment {
+  const tail: BaseMessage[] = [];
   const start = Math.max(0, messages.length - maxScan);
   for (let i = messages.length - 1; i >= start; i -= 1) {
     const message = messages[i];
     const type = getMessageType(message);
-    if (type === "tool") {
-      count += 1;
-      continue;
-    }
-    if (type === "ai" && hasToolCalls(message)) {
-      count += 1;
+    if (type === "tool" || (type === "ai" && hasToolCalls(message))) {
+      tail.push(message);
       continue;
     }
     break;
   }
-  return count;
+
+  if (tail.length === 0) {
+    return {
+      shouldStop: false,
+      reasonCode: "none",
+      totalToolCalls: 0,
+      distinctSignatures: 0,
+      longestRepeatStreak: 0,
+      consecutiveFailures: 0,
+      uniqueRefsTouched: 0,
+    };
+  }
+
+  const chronological = tail.reverse();
+  const signatures: string[] = [];
+  const refs = new Set<string>();
+  let consecutiveFailures = 0;
+  let failureStreakOpen = true;
+  for (let i = chronological.length - 1; i >= 0; i -= 1) {
+    const message = chronological[i];
+    const type = getMessageType(message);
+    if (type === "ai") {
+      const signature = getSingleToolCallSignature(message);
+      if (signature) {
+        signatures.push(signature);
+      }
+      continue;
+    }
+    if (type === "tool") {
+      const meta = parseToolResultMeta(message);
+      if (meta.ref) {
+        refs.add(meta.ref);
+      }
+      if (failureStreakOpen && meta.success === false) {
+        consecutiveFailures += 1;
+      } else if (meta.success === true) {
+        failureStreakOpen = false;
+      }
+    }
+  }
+
+  let longestRepeatStreak = 0;
+  let runningStreak = 0;
+  let previousSignature = "";
+  for (const signature of signatures) {
+    if (signature === previousSignature) {
+      runningStreak += 1;
+    } else {
+      previousSignature = signature;
+      runningStreak = 1;
+    }
+    if (runningStreak > longestRepeatStreak) {
+      longestRepeatStreak = runningStreak;
+    }
+  }
+
+  const totalToolCalls = signatures.length;
+  const distinctSignatures = new Set(signatures).size;
+  const uniqueRefsTouched = refs.size;
+
+  const hardCap = tail.length >= 140;
+  const repeatedIdenticalCall = longestRepeatStreak >= 6;
+  const repeatedFailures = consecutiveFailures >= 4;
+  const lowDiversityChurn =
+    totalToolCalls >= 24 && distinctSignatures <= 2 && (uniqueRefsTouched === 0 || uniqueRefsTouched <= 2);
+
+  const reasonCode = hardCap
+    ? "hard_cap"
+    : repeatedIdenticalCall
+      ? "repeat_streak"
+      : repeatedFailures
+        ? "failure_streak"
+        : lowDiversityChurn
+          ? "low_diversity_churn"
+          : "none";
+
+  return {
+    shouldStop: reasonCode !== "none",
+    reasonCode,
+    totalToolCalls,
+    distinctSignatures,
+    longestRepeatStreak,
+    consecutiveFailures,
+    uniqueRefsTouched,
+  };
 }
 
 function parseDirectCommand(input: string): ToolCall | null {
@@ -4885,12 +5440,26 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
     }
   }
 
-  const toolLoopDepth = countConsecutiveToolLoopMessages(state.messages as BaseMessage[]);
-  if (toolLoopDepth >= 30) {
+  const loopAssessment = assessToolLoop(state.messages as BaseMessage[]);
+  if (loopAssessment.shouldStop) {
+    const reasonText =
+      loopAssessment.reasonCode === "repeat_streak"
+        ? `repeated identical tool call (${loopAssessment.longestRepeatStreak}x in a row)`
+        : loopAssessment.reasonCode === "failure_streak"
+          ? `repeated tool failures (${loopAssessment.consecutiveFailures} consecutive failures)`
+          : loopAssessment.reasonCode === "low_diversity_churn"
+            ? "many low-diversity tool calls with limited page progress"
+            : "extended tool-call chain reached the safety cap";
+
     return {
       messages: [
         new AIMessage(
-          "Stopping this run due to repeated tool calls without completion. Please retry with a clearer step-by-step request or a stronger model."
+          `Stopping this run to avoid a stuck automation loop (${reasonText}). ` +
+            `Progress so far: ${loopAssessment.totalToolCalls} tool calls, ` +
+            `${loopAssessment.distinctSignatures} distinct call patterns, ` +
+            `${loopAssessment.uniqueRefsTouched} fields/elements touched. ` +
+            "Please continue with a targeted instruction such as 'continue from current state and submit now' " +
+            "or 'fill only remaining required fields and then submit'."
         ),
       ],
     };
@@ -4900,7 +5469,9 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
     apiKey: settings.apiKey,
     model: settings.model,
     // temperature: 0.2,
-  }).bindTools(tools);
+  }).bindTools(tools, {
+    parallel_tool_calls: false,
+  });
 
   const response = await model.invoke(
     [
@@ -4910,7 +5481,8 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call tabs_create to open a new tab when the user wants to visit a URL, search the web, or navigate to a site. Provide the full URL (e.g., 'https://google.com'). For search queries, use 'https://www.google.com/search?q=<encoded_query>'. Do NOT create duplicate tabs — call tabs_context first to check if the target URL is already open, and switch to it instead if so. " +
         "Call read_page with tabId and optional depth/filter/max_chars/ref_id to inspect page structure and get ref IDs. " +
         "Call find with tabId and a natural language query to locate matching elements quickly. " +
-        "Call form_input with tabId, ref, and value to set form fields (including inputs, selects, and textareas). " +
+        "Call form_input to set form fields; use single mode (tabId, ref, value) or batch mode (tabId, inputs:[{ref,value},...]). " +
+        "For multi-field forms, prefer batching independent fields in one call (text fields together, checkboxes together, radios together, selects together), then submit only after all required fields are filled. " +
         "Call computer with action and tabId for mouse/keyboard interactions, scrolling, waiting, drag, hover, screenshots, and zoom. " +
         "Call upload_image with imageId and tabId plus exactly one of ref/coordinate to upload screenshots or images to file inputs or drag-drop targets. " +
         "Call file_upload with tabId, ref, and absolute local file paths to upload files directly to file input elements. " +
@@ -4920,6 +5492,8 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +
         "Call javascript_tool with action='javascript_exec', text, and tabId when user asks to run JavaScript on a page. " +
+        "When the user gives a direct imperative task (especially phrasing like 'no questions asked' or 'should not fail'), execute end-to-end without asking for confirmation. " +
+        "If an interaction fails, autonomously retry with up to 3 alternative strategies (refresh refs/find, hover then click, click a more specific matching element) before reporting failure. " +
         "For page location use window.location.href. Prefer scripts that return a value."
       ),
       ...state.messages,
@@ -4928,6 +5502,34 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
       signal: fallbackAbortSignal,
     }
   );
+
+  const responseWithTools = response as unknown as {
+    content: unknown;
+    tool_calls?: Array<{
+      name: string;
+      args: Record<string, unknown>;
+      id?: string;
+      type?: "tool_call";
+    }>;
+  };
+  if (Array.isArray(responseWithTools.tool_calls) && responseWithTools.tool_calls.length > 1) {
+    const [firstTool] = responseWithTools.tool_calls;
+    return {
+      messages: [
+        new AIMessage({
+          content: responseWithTools.content ?? "",
+          tool_calls: [
+            {
+              name: firstTool.name,
+              args: firstTool.args ?? {},
+              id: firstTool.id ?? crypto.randomUUID(),
+              type: "tool_call",
+            },
+          ],
+        }),
+      ],
+    };
+  }
 
   return { messages: [response] };
 };
@@ -4964,7 +5566,9 @@ function fromPersistedMessage(message: PersistedMessage): BaseMessage {
     return new HumanMessage(message.content);
   }
   if (message.role === "tool") {
-    return new ToolMessage(message.content, "restored_tool_call", "restored_tool");
+    // Persisted history stores only plain text, not the original tool_call linkage metadata.
+    // Rehydrating as ToolMessage can create orphan tool results that OpenAI rejects.
+    return new AIMessage(`Tool result snapshot: ${message.content}`);
   }
   return new AIMessage(message.content);
 }
@@ -5002,23 +5606,23 @@ export async function runGraphTurn(
   };
 
   let previousMessageCount = 0;
-  let hasCheckpoint = false;
   let checkpointMessagesCount = 0;
+  let hasCheckpointMessages = false;
   try {
     const checkpointState = await graph.getState(threadConfig);
-    hasCheckpoint = Boolean(checkpointState?.values);
     const rawMessages = (checkpointState?.values as { messages?: unknown } | undefined)?.messages;
     if (Array.isArray(rawMessages)) {
       checkpointMessagesCount = rawMessages.length;
+      hasCheckpointMessages = rawMessages.length > 0;
     }
   } catch {
-    hasCheckpoint = false;
+    hasCheckpointMessages = false;
   }
 
-  const seedMessages = hasCheckpoint
+  const seedMessages = hasCheckpointMessages
     ? []
     : (seed?.messages ?? []).map(fromPersistedMessage);
-  previousMessageCount = hasCheckpoint ? checkpointMessagesCount : seedMessages.length;
+  previousMessageCount = hasCheckpointMessages ? checkpointMessagesCount : seedMessages.length;
 
   let state: Awaited<ReturnType<typeof graph.invoke>> | null = null;
   fallbackSettings = settings;
