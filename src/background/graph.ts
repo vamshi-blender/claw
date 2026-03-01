@@ -15,11 +15,9 @@ type PersistedMessage = {
   content: string;
 };
 
-export type LlmSettings = {
-  provider: "openai";
-  model: string;
-  apiKey: string;
-};
+export type LlmSettings =
+  | { provider: "openai"; model: string; apiKey: string }
+  | { provider: "ollama"; model: string; baseUrl: string };
 
 export type PersistedThreadState = {
   turn: number;
@@ -6303,13 +6301,16 @@ function parseDirectCommand(input: string): ToolCall | null {
 async function loadLlmSettingsFromStorage(): Promise<LlmSettings | undefined> {
   const result = await chrome.storage.local.get("llmSettings");
   const settings = result.llmSettings as LlmSettings | undefined;
-  if (!settings || settings.provider !== "openai") {
-    return undefined;
+  if (!settings) return undefined;
+  if (settings.provider === "openai") {
+    if (!settings.apiKey || !settings.model) return undefined;
+    return settings;
   }
-  if (!settings.apiKey || !settings.model) {
-    return undefined;
+  if (settings.provider === "ollama") {
+    if (!settings.model) return undefined;
+    return settings;
   }
-  return settings;
+  return undefined;
 }
 
 function forcedToolCallMessage(call: ToolCall): AIMessage {
@@ -6328,10 +6329,10 @@ function forcedToolCallMessage(call: ToolCall): AIMessage {
 
 const llmNode = async (state: typeof MessagesAnnotation.State) => {
   const settings = (await loadLlmSettingsFromStorage()) ?? fallbackSettings;
-  if (!settings?.apiKey || !settings?.model) {
+  if (!settings?.model) {
     return {
       messages: [
-        new AIMessage("Missing OpenAI settings. Open extension Options and save model + API key."),
+        new AIMessage("Missing LLM settings. Open extension Options and configure a provider + model."),
       ],
     };
   }
@@ -6371,11 +6372,18 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
     };
   }
 
-  const model = new ChatOpenAI({
-    apiKey: settings.apiKey,
-    model: settings.model,
-    // temperature: 0.2,
-  }).bindTools(tools, {
+  const model = (
+    settings.provider === "ollama"
+      ? new ChatOpenAI({
+          apiKey: "ollama",
+          model: settings.model,
+          configuration: { baseURL: `${settings.baseUrl}/v1` },
+        })
+      : new ChatOpenAI({
+          apiKey: settings.apiKey,
+          model: settings.model,
+        })
+  ).bindTools(tools, {
     parallel_tool_calls: false,
   });
 
@@ -6544,7 +6552,7 @@ export async function runGraphTurn(
         ...threadConfig,
         streamMode: "values",
         signal: abortSignal,
-        recursionLimit: 40,
+        recursionLimit: 100,
       }
     )) as AsyncIterable<{ messages?: BaseMessage[] }>;
 
@@ -6600,7 +6608,7 @@ export async function runGraphTurn(
       {
         ...threadConfig,
         signal: abortSignal,
-        recursionLimit: 40,
+        recursionLimit: 100,
       }
     );
   }

@@ -5,14 +5,14 @@ Minimal MV3 Chrome extension that uses LangGraph in the background service worke
 ## What this demonstrates
 
 - Stateful orchestration with `StateGraph`
-- OpenAI chatbot responses (`ChatOpenAI`) for non-tool prompts
+- OpenAI or Ollama chatbot responses (`ChatOpenAI` / Ollama-compatible endpoint) for non-tool prompts
 - Tool calling with a mock CDP tool
 - Explicit state fields (`input`, `response`, `turn`, `messages`, `pendingToolCall`, `lastToolResult`)
 - Memory via:
   - LangGraph `MemorySaver` checkpointer (thread-level state while worker instance is alive)
   - `chrome.storage.local` persistence (survives service-worker restarts)
 - Side panel UI -> background messaging -> graph invocation loop
-- Options page for selecting model and storing API key
+- Options page for selecting provider (OpenAI or Ollama), model, and credentials
 
 ## Architecture
 
@@ -20,7 +20,9 @@ Minimal MV3 Chrome extension that uses LangGraph in the background service worke
   - UI for input/thread id
   - Sends `RUN_GRAPH` messages to background worker
 - `options.html` + `options.js`:
-  - Saves OpenAI `model` + `apiKey` into `chrome.storage.local` as `llmSettings`
+  - Saves provider (`openai` or `ollama`), `model`, and credentials into `chrome.storage.local` as `llmSettings`
+  - For Ollama: saves `baseUrl` (default `http://localhost:11434`) instead of an API key
+  - Includes a **Test Connection** button (Ollama only) to verify Ollama is reachable before saving
 - `background.js` (service worker):
   - Hosts LangGraph app
   - Loads/saves thread memory in `chrome.storage.local`
@@ -52,7 +54,41 @@ Replace the mock tool implementation in `src/background/graph.ts` with real acti
 4. Enable **Developer mode**.
 5. Click **Load unpacked** and select the repo `dist` folder.
 6. Click the extension action icon to open the side panel.
-7. Open extension options and save your OpenAI API key + model.
+7. Open extension options and configure your provider + model (see below).
+
+## Provider configuration
+
+### OpenAI
+1. Open extension options.
+2. Select **OpenAI** from the Provider dropdown.
+3. Enter your model name (e.g. `gpt-4.1-mini-2025-04-14`).
+4. Enter your OpenAI API key (`sk-...`).
+5. Click **Save Settings**.
+
+### Ollama (local)
+Ollama is the default provider on first launch, with model `gpt-oss:20b-cloud`.
+
+**One-time setup — allow cross-origin requests from the extension:**
+
+Set the `OLLAMA_ORIGINS` environment variable to `*` in your system environment variables, then restart Ollama. Without this, Ollama will reject requests coming from the `chrome-extension://` origin.
+
+> On Windows: open *System Properties → Environment Variables*, add a new User variable:
+> - Name: `OLLAMA_ORIGINS`
+> - Value: `*`
+>
+> Then restart the Ollama app/service.
+
+**In extension options:**
+1. Select **Ollama (local)** from the Provider dropdown.
+2. Enter your model name (e.g. `gpt-oss:20b-cloud`, `qwen3.5:cloud`, `ministral-3:3b`).
+3. Set Base URL (default: `http://localhost:11434`).
+4. Click **Test Connection** to verify Ollama is reachable and CORS is configured correctly.
+5. Click **Save Settings**.
+
+> **Note:** Not all Ollama models support tool/function calling. Models confirmed to work:
+> - `gpt-oss:20b-cloud` ✓
+> - `qwen3.5:cloud` ✓
+> - `ministral-3:3b` ✗ (no tool calling — will not work with this extension)
 
 ## Quick test
 

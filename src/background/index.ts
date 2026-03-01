@@ -35,13 +35,16 @@ async function saveThreadState(threadId: string, state: PersistedThreadState) {
 async function loadLlmSettings(): Promise<LlmSettings | undefined> {
   const result = await chrome.storage.local.get("llmSettings");
   const settings = result.llmSettings as LlmSettings | undefined;
-  if (!settings || settings.provider !== "openai") {
-    return undefined;
+  if (!settings) return undefined;
+  if (settings.provider === "openai") {
+    if (!settings.apiKey || !settings.model) return undefined;
+    return settings;
   }
-  if (!settings.apiKey || !settings.model) {
-    return undefined;
+  if (settings.provider === "ollama") {
+    if (!settings.model) return undefined;
+    return settings;
   }
-  return settings;
+  return undefined;
 }
 
 async function ensureClawTabGroup(tab: chrome.tabs.Tab) {
@@ -91,7 +94,7 @@ chrome.runtime.onMessage.addListener((message: GraphRequest, _sender, sendRespon
     try {
       const llmSettings = await loadLlmSettings();
       if (!llmSettings) {
-        sendResponse({ ok: false, error: "Open Options and save OpenAI API key + model first." });
+        sendResponse({ ok: false, error: "Open Options and configure a provider + model first." });
         return;
       }
 

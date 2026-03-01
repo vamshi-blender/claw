@@ -9,22 +9,35 @@
   <body>
     <main class="panel">
       <h1>Chat Model Settings</h1>
-      <p class="sub">Choose an OpenAI model and save your API key for this extension.</p>
+      <p class="sub">Choose a provider and model for this extension.</p>
 
       <label>
         Provider
-        <input id="provider" type="text" value="openai" disabled />
+        <select id="provider">
+          <option value="openai">OpenAI</option>
+          <option value="ollama">Ollama (local)</option>
+        </select>
       </label>
 
       <label>
         Model
-        <input id="model" type="text" value="gpt-4.1-mini-2025-04-14" placeholder="e.g. gpt-4.1-mini-2025-04-14" />
+        <input id="model" type="text" placeholder="e.g. gpt-4.1-mini-2025-04-14" />
       </label>
 
-      <label>
+      <label id="apiKeyLabel">
         OpenAI API Key
         <input id="apiKey" type="password" placeholder="sk-..." />
       </label>
+
+      <label id="baseUrlLabel" style="display:none">
+        Ollama Base URL
+        <input id="baseUrl" type="text" value="http://localhost:11434" placeholder="http://localhost:11434" />
+      </label>
+
+      <div id="testRow" style="display:none">
+        <button id="testBtn" type="button">Test Connection</button>
+        <span id="testStatus"></span>
+      </div>
 
       <button id="saveBtn" type="button">Save Settings</button>
       <pre id="status"></pre>
