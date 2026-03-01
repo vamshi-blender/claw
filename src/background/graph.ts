@@ -434,8 +434,22 @@ function keyDefinitionFromName(input: string): KeyDefinition | null {
     insert: { key: "Insert", code: "Insert", keyCode: 45 },
     control: { key: "Control", code: "ControlLeft", keyCode: 17 },
     ctrl: { key: "Control", code: "ControlLeft", keyCode: 17 },
+    controlright: { key: "Control", code: "ControlRight", keyCode: 17 },
+    ctrlright: { key: "Control", code: "ControlRight", keyCode: 17 },
+    rightctrl: { key: "Control", code: "ControlRight", keyCode: 17 },
+    rctrl: { key: "Control", code: "ControlRight", keyCode: 17 },
     shift: { key: "Shift", code: "ShiftLeft", keyCode: 16 },
+    shiftright: { key: "Shift", code: "ShiftRight", keyCode: 16 },
+    rightshift: { key: "Shift", code: "ShiftRight", keyCode: 16 },
+    rshift: { key: "Shift", code: "ShiftRight", keyCode: 16 },
     alt: { key: "Alt", code: "AltLeft", keyCode: 18 },
+    altleft: { key: "Alt", code: "AltLeft", keyCode: 18 },
+    leftalt: { key: "Alt", code: "AltLeft", keyCode: 18 },
+    lalt: { key: "Alt", code: "AltLeft", keyCode: 18 },
+    altright: { key: "Alt", code: "AltRight", keyCode: 18 },
+    rightalt: { key: "Alt", code: "AltRight", keyCode: 18 },
+    ralt: { key: "Alt", code: "AltRight", keyCode: 18 },
+    altgr: { key: "AltGraph", code: "AltRight", keyCode: 18 },
     meta: { key: "Meta", code: "MetaLeft", keyCode: 91 },
     cmd: { key: "Meta", code: "MetaLeft", keyCode: 91 },
     windows: { key: "Meta", code: "MetaLeft", keyCode: 91 },
@@ -493,6 +507,68 @@ function keyDefinitionFromName(input: string): KeyDefinition | null {
   }
 
   return null;
+}
+
+function charToKeyToken(char: string): string | null {
+  if (!char) {
+    return null;
+  }
+
+  if (/^[a-z]$/.test(char)) {
+    return char;
+  }
+  if (/^[A-Z]$/.test(char)) {
+    return `Shift+${char.toLowerCase()}`;
+  }
+  if (/^\d$/.test(char)) {
+    return char;
+  }
+
+  const direct: Record<string, string> = {
+    " ": "space",
+    "\n": "enter",
+    "\r": "enter",
+    "\t": "tab",
+    ".": ".",
+    ",": ",",
+    "/": "/",
+    "\\": "\\",
+    "-": "-",
+    "=": "=",
+    ";": ";",
+    "'": "'",
+    "[": "[",
+    "]": "]",
+    "`": "`",
+  };
+  if (direct[char]) {
+    return direct[char];
+  }
+
+  const shifted: Record<string, string> = {
+    "!": "Shift+1",
+    "@": "Shift+2",
+    "#": "Shift+3",
+    "$": "Shift+4",
+    "%": "Shift+5",
+    "^": "Shift+6",
+    "&": "Shift+7",
+    "*": "Shift+8",
+    "(": "Shift+9",
+    ")": "Shift+0",
+    "_": "Shift+-",
+    "+": "Shift+=",
+    "{": "Shift+[",
+    "}": "Shift+]",
+    "|": "Shift+\\",
+    ":": "Shift+;",
+    "\"": "Shift+'",
+    "<": "Shift+,",
+    ">": "Shift+.",
+    "?": "Shift+/",
+    "~": "Shift+`",
+  };
+  return shifted[char] ?? null;
 }
 
 async function dispatchClick(
@@ -676,13 +752,71 @@ async function dispatchKeyToken(
   }
 
   const keyDef = keyDefinitionFromName(parsed.key);
+  const loweredKey = parsed.key.trim().toLowerCase().replace(/\s+/g, "");
+  if (!keyDef && (loweredKey === "bothalt" || loweredKey === "both_alt")) {
+    const bothAltDefs: KeyDefinition[] = [
+      { key: "Alt", code: "AltLeft", keyCode: 18 },
+      { key: "Alt", code: "AltRight", keyCode: 18 },
+    ];
+    const modifiers = baseModifierBitmask | MODIFIER_BITS.alt;
+
+    for (const altDef of bothAltDefs) {
+      await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+        type: "rawKeyDown",
+        key: altDef.key,
+        code: altDef.code,
+        windowsVirtualKeyCode: altDef.keyCode,
+        nativeVirtualKeyCode: altDef.keyCode,
+        modifiers,
+      });
+    }
+    for (let i = bothAltDefs.length - 1; i >= 0; i -= 1) {
+      const altDef = bothAltDefs[i];
+      await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: altDef.key,
+        code: altDef.code,
+        windowsVirtualKeyCode: altDef.keyCode,
+        nativeVirtualKeyCode: altDef.keyCode,
+        modifiers,
+      });
+    }
+
+    return { ok: true as const, key: "BothAlt" };
+  }
   if (!keyDef) {
     return { ok: false as const, error: `Unsupported key '${parsed.key}'.` };
   }
 
-  const modifiers = baseModifierBitmask | tokenModifierBitmask;
+  const modifierKeyDefs: Record<ModifierName, KeyDefinition> = {
+    ctrl: { key: "Control", code: "ControlLeft", keyCode: 17 },
+    shift: { key: "Shift", code: "ShiftLeft", keyCode: 16 },
+    alt: { key: "Alt", code: "AltLeft", keyCode: 18 },
+    meta: { key: "Meta", code: "MetaLeft", keyCode: 91 },
+  };
+  const tokenModifiers = parsed.modifiers.filter((name) => {
+    if (name === "ctrl") return keyDef.code !== "ControlLeft";
+    if (name === "shift") return keyDef.code !== "ShiftLeft";
+    if (name === "alt") return keyDef.code !== "AltLeft";
+    if (name === "meta") return keyDef.code !== "MetaLeft";
+    return true;
+  });
+
+  const modifiers = baseModifierBitmask | tokenModifiers.reduce((bits, mod) => bits | MODIFIER_BITS[mod], 0);
   const hasNonShiftModifier = (modifiers & (MODIFIER_BITS.alt | MODIFIER_BITS.ctrl | MODIFIER_BITS.meta)) !== 0;
   const printableText = keyDef.text && !hasNonShiftModifier ? keyDef.text : undefined;
+
+  for (const mod of tokenModifiers) {
+    const modDef = modifierKeyDefs[mod];
+    await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+      type: "rawKeyDown",
+      key: modDef.key,
+      code: modDef.code,
+      windowsVirtualKeyCode: modDef.keyCode,
+      nativeVirtualKeyCode: modDef.keyCode,
+      modifiers,
+    });
+  }
 
   await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
     type: printableText ? "keyDown" : "rawKeyDown",
@@ -701,6 +835,19 @@ async function dispatchKeyToken(
     nativeVirtualKeyCode: keyDef.keyCode,
     modifiers,
   });
+
+  for (let i = tokenModifiers.length - 1; i >= 0; i -= 1) {
+    const mod = tokenModifiers[i];
+    const modDef = modifierKeyDefs[mod];
+    await chrome.debugger.sendCommand(debuggee, "Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: modDef.key,
+      code: modDef.code,
+      windowsVirtualKeyCode: modDef.keyCode,
+      nativeVirtualKeyCode: modDef.keyCode,
+      modifiers,
+    });
+  }
 
   return { ok: true as const, key: keyDef.key };
 }
@@ -1320,79 +1467,96 @@ function isAbsoluteLocalPath(path: string) {
 }
 
 async function getElementMetadataByRef(tabId: number, ref: string) {
-  const [injection] = await chrome.scripting.executeScript({
-    target: { tabId },
-    args: [ref],
-    func: (targetRef: string) => {
-      const refHash = (input: string) => {
-        let hash = 0;
-        for (let i = 0; i < input.length; i += 1) {
-          hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
-        }
-        return Math.abs(hash).toString(36);
-      };
-
-      const getRef = (path: string) => `ref_${refHash(path)}`;
-      const root = document.documentElement || document.body;
-      if (!root) {
-        return { success: false, error: "No document root found." };
-      }
-
-      const findByRef = (el: Element, path: string): Element | null => {
-        if (getRef(path) === targetRef) {
-          return el;
-        }
-        const children = Array.from(el.children);
-        for (let i = 0; i < children.length; i += 1) {
-          const child = children[i];
-          const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
-          const found = findByRef(child, childPath);
-          if (found) {
-            return found;
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [ref],
+      func: (targetRef: string) => {
+        const refHash = (input: string) => {
+          let hash = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
           }
+          return Math.abs(hash).toString(36);
+        };
+
+        const getRef = (path: string) => `ref_${refHash(path)}`;
+        const root = document.documentElement || document.body;
+        if (!root) {
+          return { success: false, error: "No document root found." };
         }
-        return null;
-      };
 
-      const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
-      if (!target) {
-        return {
-          success: false,
-          error: "Element reference not found. Use read_page/find again to refresh refs.",
+        const findByRef = (el: Element, path: string): Element | null => {
+          if (getRef(path) === targetRef) {
+            return el;
+          }
+          const children = Array.from(el.children);
+          for (let i = 0; i < children.length; i += 1) {
+            const child = children[i];
+            const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+            const found = findByRef(child, childPath);
+            if (found) {
+              return found;
+            }
+          }
+          return null;
         };
-      }
 
-      if (!(target instanceof HTMLInputElement)) {
+        const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+        if (!target) {
+          return {
+            success: false,
+            error: "Element reference not found. Use read_page/find again to refresh refs.",
+          };
+        }
+
+        if (!(target instanceof HTMLInputElement)) {
+          return {
+            success: false,
+            error: "Referenced element is not an input element.",
+            tagName: target.tagName.toLowerCase(),
+          };
+        }
+
+        const inputType = (target.type || "").toLowerCase();
+        if (inputType !== "file") {
+          return {
+            success: false,
+            error: `Referenced input is type='${inputType || "unknown"}', expected type='file'.`,
+          };
+        }
+
         return {
-          success: false,
-          error: "Referenced element is not an input element.",
-          tagName: target.tagName.toLowerCase(),
+          success: true,
+          targetElement: {
+            ref: targetRef,
+            type: "input",
+            inputType: "file",
+            multiple: target.multiple,
+            ...(target.accept ? { accept: target.accept } : {}),
+          },
         };
-      }
+      },
+    });
 
-      const inputType = (target.type || "").toLowerCase();
-      if (inputType !== "file") {
-        return {
-          success: false,
-          error: `Referenced input is type='${inputType || "unknown"}', expected type='file'.`,
-        };
-      }
-
-      return {
-        success: true,
-        targetElement: {
-          ref: targetRef,
-          type: "input",
-          inputType: "file",
-          multiple: target.multiple,
-          ...(target.accept ? { accept: target.accept } : {}),
-        },
-      };
-    },
-  });
-
-  return (
-    (injection?.result as
+    return (
+      (injection?.result as
+        | {
+            success: true;
+            targetElement: {
+              ref: string;
+              type: "input";
+              inputType: "file";
+              multiple: boolean;
+              accept?: string;
+            };
+          }
+        | { success: false; error: string; tagName?: string }
+        | undefined) ??
+      { success: false as const, error: "Failed to inspect target file input element." }
+    );
+  } catch {
+    const fallback = await evaluateTabWithDebugger<
       | {
           success: true;
           targetElement: {
@@ -1404,9 +1568,63 @@ async function getElementMetadataByRef(tabId: number, ref: string) {
           };
         }
       | { success: false; error: string; tagName?: string }
-      | undefined) ??
-    { success: false as const, error: "Failed to inspect target file input element." }
-  );
+    >(
+      tabId,
+      `(() => {
+        const targetRef = ${JSON.stringify(ref)};
+        const refHash = (input) => {
+          let hash = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+          }
+          return Math.abs(hash).toString(36);
+        };
+        const getRef = (path) => "ref_" + refHash(path);
+        const root = document.documentElement || document.body;
+        if (!root) {
+          return { success: false, error: "No document root found." };
+        }
+        const findByRef = (el, path) => {
+          if (!(el instanceof Element)) return null;
+          if (getRef(path) === targetRef) return el;
+          const children = Array.from(el.children);
+          for (let i = 0; i < children.length; i += 1) {
+            const child = children[i];
+            const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+            const found = findByRef(child, childPath);
+            if (found) return found;
+          }
+          return null;
+        };
+        const target = findByRef(root, root.tagName.toLowerCase() + ":0");
+        if (!target) {
+          return { success: false, error: "Element reference not found. Use read_page/find again to refresh refs." };
+        }
+        if (!(target instanceof HTMLInputElement)) {
+          return {
+            success: false,
+            error: "Referenced element is not an input element.",
+            tagName: target.tagName.toLowerCase(),
+          };
+        }
+        const inputType = (target.type || "").toLowerCase();
+        if (inputType !== "file") {
+          return { success: false, error: "Referenced input is type='" + (inputType || "unknown") + "', expected type='file'." };
+        }
+        return {
+          success: true,
+          targetElement: {
+            ref: targetRef,
+            type: "input",
+            inputType: "file",
+            multiple: target.multiple,
+            ...(target.accept ? { accept: target.accept } : {}),
+          },
+        };
+      })()`
+    );
+    return fallback ?? { success: false as const, error: "Failed to inspect target file input element." };
+  }
 }
 
 type RefValueSnapshot =
@@ -1664,37 +1882,305 @@ type NetworkCapturedRequest = {
 };
 
 async function ensureConsoleMonitor(tabId: number) {
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: () => {
-      type ClawConsoleStore = {
-        installed: boolean;
-        entries: Array<{
-          type: string;
-          message: string;
-          timestamp: string;
-          source?: string;
-          url?: string;
-        }>;
-        maxEntries: number;
-      };
+  const installScript = `(() => {
+    const globalObj = window;
+    if (globalObj.__clawConsoleStore?.installed) {
+      return true;
+    }
 
-      const globalObj = window as unknown as {
-        __clawConsoleStore?: ClawConsoleStore;
+    const store = globalObj.__clawConsoleStore ?? {
+      installed: false,
+      entries: [],
+      maxEntries: 2000,
+    };
+    globalObj.__clawConsoleStore = store;
+
+    const pushEntry = (entry) => {
+      store.entries.push({
+        ...entry,
+        timestamp: new Date().toISOString(),
+      });
+      if (store.entries.length > store.maxEntries) {
+        store.entries.splice(0, store.entries.length - store.maxEntries);
+      }
+    };
+
+    const safeArgToString = (value) => {
+      if (typeof value === "string") {
+        return value;
+      }
+      if (value instanceof Error) {
+        return value.stack || value.message || String(value);
+      }
+      if (value === undefined) {
+        return "undefined";
+      }
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
+      }
+    };
+
+    const inferSourceFromStack = (stack) => {
+      if (!stack) {
+        return undefined;
+      }
+      const lines = stack.split("\\n").map((line) => line.trim()).filter(Boolean);
+      const candidate = lines.find((line) => /:\\d+:\\d+/.test(line));
+      if (!candidate) {
+        return undefined;
+      }
+      return candidate.replace(/^at\\s+/, "");
+    };
+
+    const methods = ["log", "info", "warn", "error", "debug"];
+    for (const method of methods) {
+      const original = console[method].bind(console);
+      console[method] = (...args) => {
+        const errorStack = new Error().stack;
+        const message = args.map((arg) => safeArgToString(arg)).join(" ");
+        pushEntry({
+          type: method === "warn" ? "warning" : method,
+          message,
+          source: inferSourceFromStack(errorStack),
+          url: window.location.href,
+        });
+        original(...args);
       };
-      if (globalObj.__clawConsoleStore?.installed) {
-        return;
+    }
+
+    window.addEventListener("error", (event) => {
+      const message = event.message || "Unhandled error";
+      const source = event.filename
+        ? event.filename + ":" + (event.lineno || 0) + (event.colno ? ":" + event.colno : "")
+        : undefined;
+      pushEntry({
+        type: "error",
+        message,
+        source,
+        url: window.location.href,
+      });
+    });
+
+    window.addEventListener("unhandledrejection", (event) => {
+      const reason = event.reason;
+      const message =
+        typeof reason === "string"
+          ? reason
+          : reason instanceof Error
+          ? reason.stack || reason.message
+          : safeArgToString(reason);
+      pushEntry({
+        type: "exception",
+        message,
+        source: inferSourceFromStack(reason instanceof Error ? reason.stack : undefined),
+        url: window.location.href,
+      });
+    });
+
+    store.installed = true;
+    return true;
+  })()`;
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        type ClawConsoleStore = {
+          installed: boolean;
+          entries: Array<{
+            type: string;
+            message: string;
+            timestamp: string;
+            source?: string;
+            url?: string;
+          }>;
+          maxEntries: number;
+        };
+
+        const globalObj = window as unknown as {
+          __clawConsoleStore?: ClawConsoleStore;
+        };
+        if (globalObj.__clawConsoleStore?.installed) {
+          return;
+        }
+
+        const store: ClawConsoleStore = globalObj.__clawConsoleStore ?? {
+          installed: false,
+          entries: [],
+          maxEntries: 2000,
+        };
+        globalObj.__clawConsoleStore = store;
+
+        const pushEntry = (entry: { type: string; message: string; source?: string; url?: string }) => {
+          store.entries.push({
+            ...entry,
+            timestamp: new Date().toISOString(),
+          });
+          if (store.entries.length > store.maxEntries) {
+            store.entries.splice(0, store.entries.length - store.maxEntries);
+          }
+        };
+
+        const safeArgToString = (value: unknown): string => {
+          if (typeof value === "string") {
+            return value;
+          }
+          if (value instanceof Error) {
+            return value.stack || value.message || String(value);
+          }
+          if (value === undefined) {
+            return "undefined";
+          }
+          try {
+            return JSON.stringify(value);
+          } catch {
+            return String(value);
+          }
+        };
+
+        const inferSourceFromStack = (stack?: string) => {
+          if (!stack) {
+            return undefined;
+          }
+          const lines = stack.split("\n").map((line) => line.trim()).filter(Boolean);
+          const candidate = lines.find((line) => /:\d+:\d+/.test(line));
+          if (!candidate) {
+            return undefined;
+          }
+          return candidate.replace(/^at\s+/, "");
+        };
+
+        const methods: Array<"log" | "info" | "warn" | "error" | "debug"> = [
+          "log",
+          "info",
+          "warn",
+          "error",
+          "debug",
+        ];
+        for (const method of methods) {
+          const original = console[method].bind(console);
+          console[method] = (...args: unknown[]) => {
+            const errorStack = new Error().stack;
+            const message = args.map((arg) => safeArgToString(arg)).join(" ");
+            pushEntry({
+              type: method === "warn" ? "warning" : method,
+              message,
+              source: inferSourceFromStack(errorStack),
+              url: window.location.href,
+            });
+            original(...args);
+          };
+        }
+
+        window.addEventListener("error", (event) => {
+          const message = event.message || "Unhandled error";
+          const source = event.filename
+            ? `${event.filename}:${event.lineno || 0}${event.colno ? `:${event.colno}` : ""}`
+            : undefined;
+          pushEntry({
+            type: "error",
+            message,
+            source,
+            url: window.location.href,
+          });
+        });
+
+        window.addEventListener("unhandledrejection", (event) => {
+          const reason = event.reason;
+          const message =
+            typeof reason === "string"
+              ? reason
+              : reason instanceof Error
+              ? reason.stack || reason.message
+              : safeArgToString(reason);
+          pushEntry({
+            type: "exception",
+            message,
+            source: inferSourceFromStack(reason instanceof Error ? reason.stack : undefined),
+            url: window.location.href,
+          });
+        });
+
+        store.installed = true;
+      },
+    });
+  } catch {
+    await evaluateTabWithDebugger<boolean>(tabId, installScript);
+  }
+}
+
+async function readConsoleBuffer(tabId: number, clear: boolean) {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [clear],
+      func: (clearEntries: boolean) => {
+        const globalObj = window as unknown as {
+          __clawConsoleStore?: {
+            entries: Array<{
+              type: string;
+              message: string;
+              timestamp: string;
+              source?: string;
+              url?: string;
+            }>;
+          };
+        };
+        const entries = Array.isArray(globalObj.__clawConsoleStore?.entries)
+          ? [...globalObj.__clawConsoleStore!.entries]
+          : [];
+        if (clearEntries && globalObj.__clawConsoleStore) {
+          globalObj.__clawConsoleStore.entries = [];
+        }
+        return entries;
+      },
+    });
+
+    return (injection?.result as ConsoleCapturedMessage[] | undefined) ?? [];
+  } catch {
+    const fallback = await evaluateTabWithDebugger<ConsoleCapturedMessage[]>(
+      tabId,
+      `(() => {
+        const clearEntries = ${JSON.stringify(clear)};
+        const globalObj = window;
+        const entries = Array.isArray(globalObj.__clawConsoleStore?.entries)
+          ? [...globalObj.__clawConsoleStore.entries]
+          : [];
+        if (clearEntries && globalObj.__clawConsoleStore) {
+          globalObj.__clawConsoleStore.entries = [];
+        }
+        return entries;
+      })()`
+    );
+    return Array.isArray(fallback) ? fallback : [];
+  }
+}
+
+async function ensureNetworkMonitor(tabId: number) {
+  const installScript = `(() => {
+      const globalObj = window;
+      const createStore = () => ({
+        installed: false,
+        currentOrigin: window.location.origin,
+        entries: [],
+        maxEntries: 3000,
+        seenPerfKeys: {},
+      });
+
+      const store = globalObj.__clawNetworkStore ?? createStore();
+      globalObj.__clawNetworkStore = store;
+
+      if (store.currentOrigin !== window.location.origin) {
+        store.currentOrigin = window.location.origin;
+        store.entries = [];
+        store.seenPerfKeys = {};
       }
 
-      const store: ClawConsoleStore = globalObj.__clawConsoleStore ?? {
-        installed: false,
-        entries: [],
-        maxEntries: 2000,
-      };
-      globalObj.__clawConsoleStore = store;
-
-      const pushEntry = (entry: { type: string; message: string; source?: string; url?: string }) => {
+      const pushEntry = (entry) => {
         store.entries.push({
           ...entry,
           timestamp: new Date().toISOString(),
@@ -1704,126 +2190,167 @@ async function ensureConsoleMonitor(tabId: number) {
         }
       };
 
-      const safeArgToString = (value: unknown): string => {
-        if (typeof value === "string") {
-          return value;
-        }
-        if (value instanceof Error) {
-          return value.stack || value.message || String(value);
-        }
-        if (value === undefined) {
-          return "undefined";
-        }
+      const normalizeUrl = (raw) => {
         try {
-          return JSON.stringify(value);
+          return new URL(raw, window.location.href).href;
         } catch {
-          return String(value);
+          return raw;
         }
       };
 
-      const inferSourceFromStack = (stack?: string) => {
-        if (!stack) {
-          return undefined;
+      const capturePerformanceEntries = () => {
+        const nav = performance.getEntriesByType("navigation")[0];
+        if (nav) {
+          const key = "nav:" + Math.round(nav.startTime) + ":" + Math.round(nav.responseEnd) + ":" + window.location.href;
+          if (!store.seenPerfKeys[key]) {
+            store.seenPerfKeys[key] = true;
+            pushEntry({
+              url: window.location.href,
+              method: "GET",
+              resourceType: "document",
+              statusCode: undefined,
+              responseTime: Math.round(nav.duration || 0),
+              size: nav.transferSize > 0 ? nav.transferSize : undefined,
+            });
+          }
         }
-        const lines = stack.split("\n").map((line) => line.trim()).filter(Boolean);
-        const candidate = lines.find((line) => /:\d+:\d+/.test(line));
-        if (!candidate) {
-          return undefined;
-        }
-        return candidate.replace(/^at\s+/, "");
-      };
 
-      const methods: Array<"log" | "info" | "warn" | "error" | "debug"> = [
-        "log",
-        "info",
-        "warn",
-        "error",
-        "debug",
-      ];
-      for (const method of methods) {
-        const original = console[method].bind(console);
-        console[method] = (...args: unknown[]) => {
-          const errorStack = new Error().stack;
-          const message = args.map((arg) => safeArgToString(arg)).join(" ");
+        const resources = performance.getEntriesByType("resource");
+        for (const resource of resources) {
+          const key = "res:" + resource.name + ":" + Math.round(resource.startTime) + ":" + Math.round(resource.responseEnd);
+          if (store.seenPerfKeys[key]) {
+            continue;
+          }
+          store.seenPerfKeys[key] = true;
           pushEntry({
-            type: method === "warn" ? "warning" : method,
-            message,
-            source: inferSourceFromStack(errorStack),
-            url: window.location.href,
+            url: normalizeUrl(resource.name),
+            method: "GET",
+            resourceType: resource.initiatorType || "resource",
+            statusCode: undefined,
+            responseTime: Math.round(resource.duration || 0),
+            size: resource.transferSize > 0 ? resource.transferSize : undefined,
           });
-          original(...args);
-        };
+        }
+      };
+
+      capturePerformanceEntries();
+      if (store.installed) {
+        return true;
       }
 
-      window.addEventListener("error", (event) => {
-        const message = event.message || "Unhandled error";
-        const source = event.filename
-          ? `${event.filename}:${event.lineno || 0}${event.colno ? `:${event.colno}` : ""}`
-          : undefined;
-        pushEntry({
-          type: "error",
-          message,
-          source,
-          url: window.location.href,
-        });
-      });
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = async (...args) => {
+        const start = performance.now();
+        const requestInfo = args[0];
+        const requestInit = args[1];
 
-      window.addEventListener("unhandledrejection", (event) => {
-        const reason = event.reason;
-        const message =
-          typeof reason === "string"
-            ? reason
-            : reason instanceof Error
-            ? reason.stack || reason.message
-            : safeArgToString(reason);
-        pushEntry({
-          type: "exception",
-          message,
-          source: inferSourceFromStack(reason instanceof Error ? reason.stack : undefined),
-          url: window.location.href,
-        });
-      });
+        let method = "GET";
+        let url = "";
+        if (requestInfo instanceof Request) {
+          method = requestInfo.method || method;
+          url = requestInfo.url;
+        } else {
+          url = String(requestInfo);
+        }
+        if (requestInit && requestInit.method) {
+          method = requestInit.method;
+        }
+
+        const requestBody = requestInit && typeof requestInit.body === "string" ? requestInit.body : undefined;
+
+        try {
+          const response = await originalFetch(...args);
+          const elapsed = Math.round(performance.now() - start);
+          const contentLength = response.headers.get("content-length");
+          const parsedSize = contentLength ? Number.parseInt(contentLength, 10) : NaN;
+          pushEntry({
+            url: normalizeUrl(response.url || url),
+            method: String(method).toUpperCase(),
+            resourceType: "fetch",
+            statusCode: response.status,
+            responseTime: elapsed,
+            size: Number.isFinite(parsedSize) ? parsedSize : undefined,
+            ...(requestBody ? { requestBody } : {}),
+          });
+          return response;
+        } catch (error) {
+          const elapsed = Math.round(performance.now() - start);
+          pushEntry({
+            url: normalizeUrl(url),
+            method: String(method).toUpperCase(),
+            resourceType: "fetch",
+            statusCode: 0,
+            responseTime: elapsed,
+            ...(requestBody ? { requestBody } : {}),
+          });
+          throw error;
+        }
+      };
+
+      const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (method, url, async, username, password) {
+        this.__clawMeta = {
+          method: (method || "GET").toUpperCase(),
+          url: typeof url === "string" ? url : String(url),
+          start: 0,
+          body: undefined,
+        };
+        return originalOpen.call(this, method, url, async ?? true, username ?? null, password ?? null);
+      };
+
+      XMLHttpRequest.prototype.send = function (body) {
+        const xhr = this;
+        if (xhr.__clawMeta) {
+          xhr.__clawMeta.start = performance.now();
+          if (typeof body === "string") {
+            xhr.__clawMeta.body = body;
+          }
+        }
+
+        const onLoadEnd = () => {
+          const meta = xhr.__clawMeta || {};
+          const startedAt = typeof meta.start === "number" ? meta.start : performance.now();
+          const elapsed = Math.round(performance.now() - startedAt);
+          let size;
+          try {
+            const response = xhr.response;
+            if (response instanceof ArrayBuffer) {
+              size = response.byteLength;
+            } else if (typeof response === "string") {
+              size = response.length;
+            } else if (response && typeof response.size === "number") {
+              size = response.size;
+            }
+          } catch {
+            size = undefined;
+          }
+
+          pushEntry({
+            url: normalizeUrl(String(xhr.responseURL || meta.url || "")),
+            method: String(meta.method || "GET").toUpperCase(),
+            resourceType: "xhr",
+            statusCode: Number.isFinite(xhr.status) ? xhr.status : undefined,
+            responseTime: elapsed,
+            ...(typeof size === "number" && size >= 0 ? { size } : {}),
+            ...(typeof meta.body === "string" ? { requestBody: meta.body } : {}),
+          });
+          xhr.removeEventListener("loadend", onLoadEnd);
+        };
+
+        xhr.addEventListener("loadend", onLoadEnd);
+        return originalSend.call(this, body ?? null);
+      };
 
       store.installed = true;
-    },
-  });
-}
+      return true;
+    })()`;
 
-async function readConsoleBuffer(tabId: number, clear: boolean) {
-  const [injection] = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    args: [clear],
-    func: (clearEntries: boolean) => {
-      const globalObj = window as unknown as {
-        __clawConsoleStore?: {
-          entries: Array<{
-            type: string;
-            message: string;
-            timestamp: string;
-            source?: string;
-            url?: string;
-          }>;
-        };
-      };
-      const entries = Array.isArray(globalObj.__clawConsoleStore?.entries)
-        ? [...globalObj.__clawConsoleStore!.entries]
-        : [];
-      if (clearEntries && globalObj.__clawConsoleStore) {
-        globalObj.__clawConsoleStore.entries = [];
-      }
-      return entries;
-    },
-  });
-
-  return (injection?.result as ConsoleCapturedMessage[] | undefined) ?? [];
-}
-
-async function ensureNetworkMonitor(tabId: number) {
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: () => {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
       type ClawNetworkStore = {
         installed: boolean;
         currentOrigin: string;
@@ -2025,135 +2552,179 @@ async function ensureNetworkMonitor(tabId: number) {
       };
 
       store.installed = true;
-    },
-  });
+      },
+    });
+  } catch {
+    await evaluateTabWithDebugger<boolean>(tabId, installScript);
+  }
 }
 
 async function readNetworkBuffer(tabId: number, clear: boolean) {
-  const [injection] = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    args: [clear],
-    func: (clearEntries: boolean) => {
-      const globalObj = window as unknown as {
-        __clawNetworkStore?: {
-          currentOrigin: string;
-          entries: NetworkCapturedRequest[];
-          seenPerfKeys: Record<string, true>;
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [clear],
+      func: (clearEntries: boolean) => {
+        const globalObj = window as unknown as {
+          __clawNetworkStore?: {
+            currentOrigin: string;
+            entries: NetworkCapturedRequest[];
+            seenPerfKeys: Record<string, true>;
+          };
         };
-      };
 
-      const store = globalObj.__clawNetworkStore;
-      if (!store) {
-        return [] as NetworkCapturedRequest[];
-      }
+        const store = globalObj.__clawNetworkStore;
+        if (!store) {
+          return [] as NetworkCapturedRequest[];
+        }
 
-      if (store.currentOrigin !== window.location.origin) {
-        store.currentOrigin = window.location.origin;
-        store.entries = [];
-        store.seenPerfKeys = {};
-      }
+        if (store.currentOrigin !== window.location.origin) {
+          store.currentOrigin = window.location.origin;
+          store.entries = [];
+          store.seenPerfKeys = {};
+        }
 
-      const entries = Array.isArray(store.entries) ? [...store.entries] : [];
-      if (clearEntries) {
-        store.entries = [];
-      }
-      return entries;
-    },
-  });
+        const entries = Array.isArray(store.entries) ? [...store.entries] : [];
+        if (clearEntries) {
+          store.entries = [];
+        }
+        return entries;
+      },
+    });
 
-  return (injection?.result as NetworkCapturedRequest[] | undefined) ?? [];
+    return (injection?.result as NetworkCapturedRequest[] | undefined) ?? [];
+  } catch {
+    const fallback = await evaluateTabWithDebugger<NetworkCapturedRequest[]>(
+      tabId,
+      `(() => {
+        const clearEntries = ${JSON.stringify(clear)};
+        const globalObj = window;
+        const store = globalObj.__clawNetworkStore;
+        if (!store) {
+          return [];
+        }
+        if (store.currentOrigin !== window.location.origin) {
+          store.currentOrigin = window.location.origin;
+          store.entries = [];
+          store.seenPerfKeys = {};
+        }
+        const entries = Array.isArray(store.entries) ? [...store.entries] : [];
+        if (clearEntries) {
+          store.entries = [];
+        }
+        return entries;
+      })()`
+    );
+    return Array.isArray(fallback) ? fallback : [];
+  }
 }
 
 async function readUploadedFilesFromInput(tabId: number, ref: string) {
-  const [injection] = await chrome.scripting.executeScript({
-    target: { tabId },
-    args: [ref],
-    func: async (targetRef: string) => {
-      const refHash = (input: string) => {
-        let hash = 0;
-        for (let i = 0; i < input.length; i += 1) {
-          hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
-        }
-        return Math.abs(hash).toString(36);
-      };
-
-      const getRef = (path: string) => `ref_${refHash(path)}`;
-      const root = document.documentElement || document.body;
-      if (!root) {
-        return { success: false, error: "No document root found.", files: [] };
-      }
-
-      const findByRef = (el: Element, path: string): Element | null => {
-        if (getRef(path) === targetRef) {
-          return el;
-        }
-        const children = Array.from(el.children);
-        for (let i = 0; i < children.length; i += 1) {
-          const child = children[i];
-          const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
-          const found = findByRef(child, childPath);
-          if (found) {
-            return found;
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [ref],
+      func: async (targetRef: string) => {
+        const refHash = (input: string) => {
+          let hash = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
           }
-        }
-        return null;
-      };
-
-      const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
-      if (!(target instanceof HTMLInputElement) || target.type.toLowerCase() !== "file") {
-        return {
-          success: false,
-          error: "Target element is not a file input.",
-          files: [],
+          return Math.abs(hash).toString(36);
         };
-      }
 
-      const files = Array.from(target.files ?? []);
-      const filesUploaded: Array<{
-        filename: string;
-        size: number;
-        mimeType?: string;
-        dimensions?: string;
-      }> = [];
+        const getRef = (path: string) => `ref_${refHash(path)}`;
+        const root = document.documentElement || document.body;
+        if (!root) {
+          return { success: false, error: "No document root found.", files: [] };
+        }
 
-      for (const file of files) {
-        const fileData: {
+        const findByRef = (el: Element, path: string): Element | null => {
+          if (getRef(path) === targetRef) {
+            return el;
+          }
+          const children = Array.from(el.children);
+          for (let i = 0; i < children.length; i += 1) {
+            const child = children[i];
+            const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+            const found = findByRef(child, childPath);
+            if (found) {
+              return found;
+            }
+          }
+          return null;
+        };
+
+        const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+        if (!(target instanceof HTMLInputElement) || target.type.toLowerCase() !== "file") {
+          return {
+            success: false,
+            error: "Target element is not a file input.",
+            files: [],
+          };
+        }
+
+        const files = Array.from(target.files ?? []);
+        const filesUploaded: Array<{
           filename: string;
           size: number;
           mimeType?: string;
           dimensions?: string;
-        } = {
-          filename: file.name,
-          size: file.size,
-        };
+        }> = [];
 
-        if (file.type) {
-          fileData.mimeType = file.type;
-        }
+        for (const file of files) {
+          const fileData: {
+            filename: string;
+            size: number;
+            mimeType?: string;
+            dimensions?: string;
+          } = {
+            filename: file.name,
+            size: file.size,
+          };
 
-        if (file.type.startsWith("image/")) {
-          try {
-            const bitmap = await createImageBitmap(file);
-            fileData.dimensions = `${bitmap.width}x${bitmap.height}`;
-            bitmap.close();
-          } catch {
-            // Ignore image dimension parsing errors.
+          if (file.type) {
+            fileData.mimeType = file.type;
           }
+
+          if (file.type.startsWith("image/")) {
+            try {
+              const bitmap = await createImageBitmap(file);
+              fileData.dimensions = `${bitmap.width}x${bitmap.height}`;
+              bitmap.close();
+            } catch {
+              // Ignore image dimension parsing errors.
+            }
+          }
+
+          filesUploaded.push(fileData);
         }
 
-        filesUploaded.push(fileData);
-      }
+        return {
+          success: true,
+          files: filesUploaded,
+        };
+      },
+    });
 
-      return {
-        success: true,
-        files: filesUploaded,
-      };
-    },
-  });
-
-  return (
-    (injection?.result as
+    return (
+      (injection?.result as
+        | {
+            success: true;
+            files: Array<{
+              filename: string;
+              size: number;
+              mimeType?: string;
+              dimensions?: string;
+            }>;
+          }
+        | { success: false; error: string; files: unknown[] }
+        | undefined) ??
+      { success: false as const, error: "Failed to read uploaded file details from input.", files: [] }
+    );
+  } catch {
+    const fallback = await evaluateTabWithDebugger<
       | {
           success: true;
           files: Array<{
@@ -2164,9 +2735,52 @@ async function readUploadedFilesFromInput(tabId: number, ref: string) {
           }>;
         }
       | { success: false; error: string; files: unknown[] }
-      | undefined) ??
-    { success: false as const, error: "Failed to read uploaded file details from input.", files: [] }
-  );
+    >(
+      tabId,
+      `(() => {
+        const targetRef = ${JSON.stringify(ref)};
+        const refHash = (input) => {
+          let hash = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+          }
+          return Math.abs(hash).toString(36);
+        };
+        const getRef = (path) => "ref_" + refHash(path);
+        const root = document.documentElement || document.body;
+        if (!root) {
+          return { success: false, error: "No document root found.", files: [] };
+        }
+        const findByRef = (el, path) => {
+          if (!(el instanceof Element)) return null;
+          if (getRef(path) === targetRef) return el;
+          const children = Array.from(el.children);
+          for (let i = 0; i < children.length; i += 1) {
+            const child = children[i];
+            const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+            const found = findByRef(child, childPath);
+            if (found) return found;
+          }
+          return null;
+        };
+        const target = findByRef(root, root.tagName.toLowerCase() + ":0");
+        if (!(target instanceof HTMLInputElement) || target.type.toLowerCase() !== "file") {
+          return { success: false, error: "Target element is not a file input.", files: [] };
+        }
+        const files = Array.from(target.files || []);
+        const filesUploaded = [];
+        for (const file of files) {
+          const fileData = { filename: file.name, size: file.size };
+          if (file.type) {
+            fileData.mimeType = file.type;
+          }
+          filesUploaded.push(fileData);
+        }
+        return { success: true, files: filesUploaded };
+      })()`
+    );
+    return fallback ?? { success: false as const, error: "Failed to read uploaded file details from input.", files: [] };
+  }
 }
 
 function getMimeTypeFromDataUrl(dataUrl: string) {
@@ -3828,20 +4442,70 @@ const computerTool = tool(
             return fail("Parameter 'text' is required for action 'type'.");
           }
 
+          const activeFieldBefore = await readActiveFieldValue(tabId);
+          if (activeFieldBefore.hasActiveField) {
+            await withDebuggerSession(tabId, async (debuggee) => {
+              await chrome.debugger.sendCommand(debuggee, "Input.insertText", { text });
+            });
+            const activeFieldAfter = await readActiveFieldValue(tabId);
+
+            return JSON.stringify({
+              success: true,
+              action,
+              tabId,
+              mode: "insert_text",
+              textEntered: text,
+              ...(activeFieldAfter.hasActiveField ? { currentFieldValue: activeFieldAfter.value ?? "" } : {}),
+              ...(activeFieldAfter.inputType === "email"
+                ? { validEmail: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(activeFieldAfter.value ?? "") }
+                : {}),
+            });
+          }
+
+          const tokens: string[] = [];
+          const skippedCharacters: string[] = [];
+          for (const char of text) {
+            const token = charToKeyToken(char);
+            if (!token) {
+              skippedCharacters.push(char);
+              continue;
+            }
+            tokens.push(token);
+          }
+
+          if (tokens.length === 0) {
+            return fail("No typable key events could be derived from the provided text.", {
+              skippedCharacters: skippedCharacters.slice(0, 20),
+            });
+          }
+
+          const dispatchedTokens: string[] = [];
+          const failedTokens: Array<{ token: string; error: string }> = [];
           await withDebuggerSession(tabId, async (debuggee) => {
-            await chrome.debugger.sendCommand(debuggee, "Input.insertText", { text });
+            for (const token of tokens) {
+              const dispatched = await dispatchKeyToken(debuggee, token, 0);
+              if (!dispatched.ok) {
+                failedTokens.push({ token, error: dispatched.error });
+                continue;
+              }
+              dispatchedTokens.push(token);
+            }
           });
-          const activeField = await readActiveFieldValue(tabId);
 
           return JSON.stringify({
-            success: true,
+            success: failedTokens.length === 0 && skippedCharacters.length === 0,
             action,
             tabId,
+            mode: "key_events",
             textEntered: text,
-            ...(activeField.hasActiveField ? { currentFieldValue: activeField.value ?? "" } : {}),
-            ...(activeField.inputType === "email"
-              ? { validEmail: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(activeField.value ?? "") }
-              : {}),
+            requestedCharacters: text.length,
+            dispatchedKeyEvents: dispatchedTokens.length,
+            skippedCharactersCount: skippedCharacters.length,
+            ...(skippedCharacters.length > 0 ? { skippedCharacters: skippedCharacters.slice(0, 20) } : {}),
+            failedKeyEventsCount: failedTokens.length,
+            ...(failedTokens.length > 0 ? { failedKeyEvents: failedTokens.slice(0, 10) } : {}),
+            note:
+              "Used keydown/keyup events because no editable field was focused. This is required for keyboard-test style pages.",
           });
         }
 
@@ -4185,54 +4849,99 @@ const fileUploadTool = tool(
         const markerValue = `upload_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
         try {
-          const markResult = await chrome.scripting.executeScript({
-            target: { tabId },
-            args: [ref, markerAttr, markerValue],
-            func: (targetRef: string, attrName: string, attrValue: string) => {
-              const refHash = (input: string) => {
-                let hash = 0;
-                for (let i = 0; i < input.length; i += 1) {
-                  hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
-                }
-                return Math.abs(hash).toString(36);
-              };
-
-              const getRef = (path: string) => `ref_${refHash(path)}`;
-              const root = document.documentElement || document.body;
-              if (!root) {
-                return { success: false, error: "No document root found." };
-              }
-
-              const findByRef = (el: Element, path: string): Element | null => {
-                if (getRef(path) === targetRef) {
-                  return el;
-                }
-                const children = Array.from(el.children);
-                for (let i = 0; i < children.length; i += 1) {
-                  const child = children[i];
-                  const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
-                  const found = findByRef(child, childPath);
-                  if (found) {
-                    return found;
-                  }
-                }
-                return null;
-              };
-
-              const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
-              if (!(target instanceof HTMLInputElement) || target.type.toLowerCase() !== "file") {
-                return { success: false, error: "Target element is not a file input." };
-              }
-
-              target.setAttribute(attrName, attrValue);
-              return { success: true };
-            },
-          });
-
-          const markPayload = markResult?.[0]?.result as
+          let markPayload:
             | { success: true }
             | { success: false; error: string }
             | undefined;
+          try {
+            const markResult = await chrome.scripting.executeScript({
+              target: { tabId },
+              args: [ref, markerAttr, markerValue],
+              func: (targetRef: string, attrName: string, attrValue: string) => {
+                const refHash = (input: string) => {
+                  let hash = 0;
+                  for (let i = 0; i < input.length; i += 1) {
+                    hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+                  }
+                  return Math.abs(hash).toString(36);
+                };
+
+                const getRef = (path: string) => `ref_${refHash(path)}`;
+                const root = document.documentElement || document.body;
+                if (!root) {
+                  return { success: false, error: "No document root found." };
+                }
+
+                const findByRef = (el: Element, path: string): Element | null => {
+                  if (getRef(path) === targetRef) {
+                    return el;
+                  }
+                  const children = Array.from(el.children);
+                  for (let i = 0; i < children.length; i += 1) {
+                    const child = children[i];
+                    const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+                    const found = findByRef(child, childPath);
+                    if (found) {
+                      return found;
+                    }
+                  }
+                  return null;
+                };
+
+                const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+                if (!(target instanceof HTMLInputElement) || target.type.toLowerCase() !== "file") {
+                  return { success: false, error: "Target element is not a file input." };
+                }
+
+                target.setAttribute(attrName, attrValue);
+                return { success: true };
+              },
+            });
+            markPayload = markResult?.[0]?.result as
+              | { success: true }
+              | { success: false; error: string }
+              | undefined;
+          } catch {
+            markPayload = await evaluateTabWithDebugger<{ success: true } | { success: false; error: string }>(
+              tabId,
+              `(() => {
+                const targetRef = ${JSON.stringify(ref)};
+                const attrName = ${JSON.stringify(markerAttr)};
+                const attrValue = ${JSON.stringify(markerValue)};
+                const refHash = (input) => {
+                  let hash = 0;
+                  for (let i = 0; i < input.length; i += 1) {
+                    hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+                  }
+                  return Math.abs(hash).toString(36);
+                };
+                const getRef = (path) => "ref_" + refHash(path);
+                const root = document.documentElement || document.body;
+                if (!root) {
+                  return { success: false, error: "No document root found." };
+                }
+                const findByRef = (el, path) => {
+                  if (!(el instanceof Element)) return null;
+                  if (getRef(path) === targetRef) return el;
+                  const children = Array.from(el.children);
+                  for (let i = 0; i < children.length; i += 1) {
+                    const child = children[i];
+                    const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+                    const found = findByRef(child, childPath);
+                    if (found) return found;
+                  }
+                  return null;
+                };
+                const target = findByRef(root, root.tagName.toLowerCase() + ":0");
+                if (!(target instanceof HTMLInputElement) || target.type.toLowerCase() !== "file") {
+                  return { success: false, error: "Target element is not a file input." };
+                }
+                target.setAttribute(attrName, attrValue);
+                return { success: true };
+              })()`
+            );
+          }
+
           if (!markPayload?.success) {
             return fail(markPayload?.error ?? "Failed to mark target file input element.");
           }
@@ -4264,16 +4973,30 @@ const fileUploadTool = tool(
             });
           });
         } finally {
-          await chrome.scripting.executeScript({
-            target: { tabId },
-            args: [markerAttr, markerValue],
-            func: (attrName: string, attrValue: string) => {
-              const el = document.querySelector(`[${attrName}="${attrValue}"]`);
-              if (el) {
-                el.removeAttribute(attrName);
-              }
-            },
-          });
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId },
+              args: [markerAttr, markerValue],
+              func: (attrName: string, attrValue: string) => {
+                const el = document.querySelector(`[${attrName}="${attrValue}"]`);
+                if (el) {
+                  el.removeAttribute(attrName);
+                }
+              },
+            });
+          } catch {
+            await evaluateTabWithDebugger<void>(
+              tabId,
+              `(() => {
+                const attrName = ${JSON.stringify(markerAttr)};
+                const attrValue = ${JSON.stringify(markerValue)};
+                const el = document.querySelector("[" + attrName + "=\\"" + attrValue + "\\"]");
+                if (el) {
+                  el.removeAttribute(attrName);
+                }
+              })()`
+            );
+          }
         }
       } catch (error) {
         return fail(String(error));
@@ -4374,106 +5097,7 @@ const uploadImageTool = tool(
 
       if (hasRef) {
         const targetRef = ref!.trim();
-        const [injection] = await chrome.scripting.executeScript({
-          target: { tabId },
-          args: [targetRef, storedImage.dataUrl, uploadFilename, mimeType],
-          func: async (targetRefArg: string, dataUrl: string, finalName: string, contentType: string) => {
-            const refHash = (input: string) => {
-              let hash = 0;
-              for (let i = 0; i < input.length; i += 1) {
-                hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
-              }
-              return Math.abs(hash).toString(36);
-            };
-
-            const getRef = (path: string) => `ref_${refHash(path)}`;
-            const root = document.documentElement || document.body;
-            if (!root) {
-              return { success: false, error: "No document root found." };
-            }
-
-            const findByRef = (el: Element, path: string): Element | null => {
-              if (getRef(path) === targetRefArg) {
-                return el;
-              }
-              const children = Array.from(el.children);
-              for (let i = 0; i < children.length; i += 1) {
-                const child = children[i];
-                const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
-                const found = findByRef(child, childPath);
-                if (found) {
-                  return found;
-                }
-              }
-              return null;
-            };
-
-            const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
-            if (!target) {
-              return {
-                success: false,
-                error: "Element reference not found. Use read_page/find again to refresh refs.",
-              };
-            }
-
-            const response = await fetch(dataUrl);
-            const blob = await response.blob();
-            const file = new File([blob], finalName, {
-              type: contentType || blob.type || "application/octet-stream",
-            });
-
-            const targetSummaryBase = {
-              ref: targetRefArg,
-              type: target.tagName.toLowerCase(),
-            };
-
-            if (target instanceof HTMLInputElement && target.type.toLowerCase() === "file") {
-              const transfer = new DataTransfer();
-              transfer.items.add(file);
-              target.files = transfer.files;
-              target.dispatchEvent(new Event("input", { bubbles: true }));
-              target.dispatchEvent(new Event("change", { bubbles: true }));
-              return {
-                success: true,
-                method: "file_input",
-                targetElement: {
-                  ...targetSummaryBase,
-                  type: "input",
-                  inputType: "file",
-                  ...(target.multiple ? { multiple: true } : {}),
-                  ...(target.accept ? { accept: target.accept } : {}),
-                },
-                uploadedFile: {
-                  name: file.name,
-                  size: file.size,
-                  mimeType: file.type,
-                },
-              };
-            }
-
-            const transfer = new DataTransfer();
-            transfer.items.add(file);
-            const dragEnter = new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer });
-            const dragOver = new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer });
-            const drop = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer });
-            target.dispatchEvent(dragEnter);
-            target.dispatchEvent(dragOver);
-            target.dispatchEvent(drop);
-
-            return {
-              success: true,
-              method: "drag_and_drop",
-              targetElement: targetSummaryBase,
-              uploadedFile: {
-                name: file.name,
-                size: file.size,
-                mimeType: file.type,
-              },
-            };
-          },
-        });
-
-        const result = (injection?.result as
+        let result: (
           | {
               success: true;
               method: "file_input" | "drag_and_drop";
@@ -4487,7 +5111,227 @@ const uploadImageTool = tool(
               uploadedFile: { name: string; size: number; mimeType: string };
             }
           | { success: false; error: string }
-          | undefined) ?? { success: false as const, error: "Failed to upload image by ref." };
+          | undefined);
+        try {
+          const [injection] = await chrome.scripting.executeScript({
+            target: { tabId },
+            args: [targetRef, storedImage.dataUrl, uploadFilename, mimeType],
+            func: async (targetRefArg: string, dataUrl: string, finalName: string, contentType: string) => {
+              const refHash = (input: string) => {
+                let hash = 0;
+                for (let i = 0; i < input.length; i += 1) {
+                  hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+                }
+                return Math.abs(hash).toString(36);
+              };
+
+              const getRef = (path: string) => `ref_${refHash(path)}`;
+              const root = document.documentElement || document.body;
+              if (!root) {
+                return { success: false, error: "No document root found." };
+              }
+
+              const findByRef = (el: Element, path: string): Element | null => {
+                if (getRef(path) === targetRefArg) {
+                  return el;
+                }
+                const children = Array.from(el.children);
+                for (let i = 0; i < children.length; i += 1) {
+                  const child = children[i];
+                  const childPath = `${path}>${child.tagName.toLowerCase()}:${i}`;
+                  const found = findByRef(child, childPath);
+                  if (found) {
+                    return found;
+                  }
+                }
+                return null;
+              };
+
+              const target = findByRef(root, `${root.tagName.toLowerCase()}:0`);
+              if (!target) {
+                return {
+                  success: false,
+                  error: "Element reference not found. Use read_page/find again to refresh refs.",
+                };
+              }
+
+              const response = await fetch(dataUrl);
+              const blob = await response.blob();
+              const file = new File([blob], finalName, {
+                type: contentType || blob.type || "application/octet-stream",
+              });
+
+              const targetSummaryBase = {
+                ref: targetRefArg,
+                type: target.tagName.toLowerCase(),
+              };
+
+              if (target instanceof HTMLInputElement && target.type.toLowerCase() === "file") {
+                const transfer = new DataTransfer();
+                transfer.items.add(file);
+                target.files = transfer.files;
+                target.dispatchEvent(new Event("input", { bubbles: true }));
+                target.dispatchEvent(new Event("change", { bubbles: true }));
+                return {
+                  success: true,
+                  method: "file_input",
+                  targetElement: {
+                    ...targetSummaryBase,
+                    type: "input",
+                    inputType: "file",
+                    ...(target.multiple ? { multiple: true } : {}),
+                    ...(target.accept ? { accept: target.accept } : {}),
+                  },
+                  uploadedFile: {
+                    name: file.name,
+                    size: file.size,
+                    mimeType: file.type,
+                  },
+                };
+              }
+
+              const transfer = new DataTransfer();
+              transfer.items.add(file);
+              const dragEnter = new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer });
+              const dragOver = new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer });
+              const drop = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer });
+              target.dispatchEvent(dragEnter);
+              target.dispatchEvent(dragOver);
+              target.dispatchEvent(drop);
+
+              return {
+                success: true,
+                method: "drag_and_drop",
+                targetElement: targetSummaryBase,
+                uploadedFile: {
+                  name: file.name,
+                  size: file.size,
+                  mimeType: file.type,
+                },
+              };
+            },
+          });
+          result = injection?.result as
+            | {
+                success: true;
+                method: "file_input" | "drag_and_drop";
+                targetElement: {
+                  ref: string;
+                  type: string;
+                  inputType?: string;
+                  multiple?: boolean;
+                  accept?: string;
+                };
+                uploadedFile: { name: string; size: number; mimeType: string };
+              }
+            | { success: false; error: string }
+            | undefined;
+        } catch {
+          result = await evaluateTabWithDebugger<
+            | {
+                success: true;
+                method: "file_input" | "drag_and_drop";
+                targetElement: {
+                  ref: string;
+                  type: string;
+                  inputType?: string;
+                  multiple?: boolean;
+                  accept?: string;
+                };
+                uploadedFile: { name: string; size: number; mimeType: string };
+              }
+            | { success: false; error: string }
+          >(
+            tabId,
+            `(() => {
+              const targetRefArg = ${JSON.stringify(targetRef)};
+              const dataUrl = ${JSON.stringify(storedImage.dataUrl)};
+              const finalName = ${JSON.stringify(uploadFilename)};
+              const contentType = ${JSON.stringify(mimeType)};
+              const refHash = (input) => {
+                let hash = 0;
+                for (let i = 0; i < input.length; i += 1) {
+                  hash = ((hash << 5) - hash + input.charCodeAt(i)) | 0;
+                }
+                return Math.abs(hash).toString(36);
+              };
+              const getRef = (path) => "ref_" + refHash(path);
+              const root = document.documentElement || document.body;
+              if (!root) {
+                return { success: false, error: "No document root found." };
+              }
+              const findByRef = (el, path) => {
+                if (!(el instanceof Element)) return null;
+                if (getRef(path) === targetRefArg) return el;
+                const children = Array.from(el.children);
+                for (let i = 0; i < children.length; i += 1) {
+                  const child = children[i];
+                  const childPath = path + ">" + child.tagName.toLowerCase() + ":" + i;
+                  const found = findByRef(child, childPath);
+                  if (found) return found;
+                }
+                return null;
+              };
+              return Promise.resolve().then(async () => {
+                const target = findByRef(root, root.tagName.toLowerCase() + ":0");
+                if (!target) {
+                  return { success: false, error: "Element reference not found. Use read_page/find again to refresh refs." };
+                }
+                const response = await fetch(dataUrl);
+                const blob = await response.blob();
+                const file = new File([blob], finalName, {
+                  type: contentType || blob.type || "application/octet-stream",
+                });
+                const targetSummaryBase = {
+                  ref: targetRefArg,
+                  type: target.tagName.toLowerCase(),
+                };
+                if (target instanceof HTMLInputElement && target.type.toLowerCase() === "file") {
+                  const transfer = new DataTransfer();
+                  transfer.items.add(file);
+                  target.files = transfer.files;
+                  target.dispatchEvent(new Event("input", { bubbles: true }));
+                  target.dispatchEvent(new Event("change", { bubbles: true }));
+                  return {
+                    success: true,
+                    method: "file_input",
+                    targetElement: {
+                      ...targetSummaryBase,
+                      type: "input",
+                      inputType: "file",
+                      ...(target.multiple ? { multiple: true } : {}),
+                      ...(target.accept ? { accept: target.accept } : {}),
+                    },
+                    uploadedFile: {
+                      name: file.name,
+                      size: file.size,
+                      mimeType: file.type,
+                    },
+                  };
+                }
+                const transfer = new DataTransfer();
+                transfer.items.add(file);
+                const dragEnter = new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer });
+                const dragOver = new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer });
+                const drop = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer });
+                target.dispatchEvent(dragEnter);
+                target.dispatchEvent(dragOver);
+                target.dispatchEvent(drop);
+                return {
+                  success: true,
+                  method: "drag_and_drop",
+                  targetElement: targetSummaryBase,
+                  uploadedFile: {
+                    name: file.name,
+                    size: file.size,
+                    mimeType: file.type,
+                  },
+                };
+              });
+            })()`
+          );
+        }
+        result = result ?? { success: false as const, error: "Failed to upload image by ref." };
 
         if (!result.success) {
           return fail(result.error, { ref: targetRef });
@@ -4509,47 +5353,7 @@ const uploadImageTool = tool(
       }
 
       const point = normalizePoint([coordinate![0], coordinate![1]]);
-      const [injection] = await chrome.scripting.executeScript({
-        target: { tabId },
-        args: [point[0], point[1], storedImage.dataUrl, uploadFilename, mimeType],
-        func: async (x: number, y: number, dataUrl: string, finalName: string, contentType: string) => {
-          const target = document.elementFromPoint(x, y) || document.body;
-          if (!target) {
-            return { success: false, error: "No drop target found at coordinate." };
-          }
-
-          const response = await fetch(dataUrl);
-          const blob = await response.blob();
-          const file = new File([blob], finalName, {
-            type: contentType || blob.type || "application/octet-stream",
-          });
-
-          const transfer = new DataTransfer();
-          transfer.items.add(file);
-          const dragEnter = new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer });
-          const dragOver = new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer });
-          const drop = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer });
-          target.dispatchEvent(dragEnter);
-          target.dispatchEvent(dragOver);
-          target.dispatchEvent(drop);
-
-          return {
-            success: true,
-            method: "drag_and_drop",
-            dropTarget: {
-              coordinate: [x, y],
-              element: target === document.body ? "document area" : target.tagName.toLowerCase(),
-            },
-            uploadedFile: {
-              name: file.name,
-              size: file.size,
-              mimeType: file.type,
-            },
-          };
-        },
-      });
-
-      const result = (injection?.result as
+      let result: (
         | {
             success: true;
             method: "drag_and_drop";
@@ -4557,7 +5361,109 @@ const uploadImageTool = tool(
             uploadedFile: { name: string; size: number; mimeType: string };
           }
         | { success: false; error: string }
-        | undefined) ?? { success: false as const, error: "Failed to upload image by coordinate." };
+        | undefined);
+      try {
+        const [injection] = await chrome.scripting.executeScript({
+          target: { tabId },
+          args: [point[0], point[1], storedImage.dataUrl, uploadFilename, mimeType],
+          func: async (x: number, y: number, dataUrl: string, finalName: string, contentType: string) => {
+            const target = document.elementFromPoint(x, y) || document.body;
+            if (!target) {
+              return { success: false, error: "No drop target found at coordinate." };
+            }
+
+            const response = await fetch(dataUrl);
+            const blob = await response.blob();
+            const file = new File([blob], finalName, {
+              type: contentType || blob.type || "application/octet-stream",
+            });
+
+            const transfer = new DataTransfer();
+            transfer.items.add(file);
+            const dragEnter = new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer });
+            const dragOver = new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer });
+            const drop = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer });
+            target.dispatchEvent(dragEnter);
+            target.dispatchEvent(dragOver);
+            target.dispatchEvent(drop);
+
+            return {
+              success: true,
+              method: "drag_and_drop",
+              dropTarget: {
+                coordinate: [x, y],
+                element: target === document.body ? "document area" : target.tagName.toLowerCase(),
+              },
+              uploadedFile: {
+                name: file.name,
+                size: file.size,
+                mimeType: file.type,
+              },
+            };
+          },
+        });
+        result = injection?.result as
+          | {
+              success: true;
+              method: "drag_and_drop";
+              dropTarget: { coordinate: [number, number]; element: string };
+              uploadedFile: { name: string; size: number; mimeType: string };
+            }
+          | { success: false; error: string }
+          | undefined;
+      } catch {
+        result = await evaluateTabWithDebugger<
+          | {
+              success: true;
+              method: "drag_and_drop";
+              dropTarget: { coordinate: [number, number]; element: string };
+              uploadedFile: { name: string; size: number; mimeType: string };
+            }
+          | { success: false; error: string }
+        >(
+          tabId,
+          `(() => {
+            const x = ${JSON.stringify(point[0])};
+            const y = ${JSON.stringify(point[1])};
+            const dataUrl = ${JSON.stringify(storedImage.dataUrl)};
+            const finalName = ${JSON.stringify(uploadFilename)};
+            const contentType = ${JSON.stringify(mimeType)};
+            return Promise.resolve().then(async () => {
+              const target = document.elementFromPoint(x, y) || document.body;
+              if (!target) {
+                return { success: false, error: "No drop target found at coordinate." };
+              }
+              const response = await fetch(dataUrl);
+              const blob = await response.blob();
+              const file = new File([blob], finalName, {
+                type: contentType || blob.type || "application/octet-stream",
+              });
+              const transfer = new DataTransfer();
+              transfer.items.add(file);
+              const dragEnter = new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer });
+              const dragOver = new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: transfer });
+              const drop = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer });
+              target.dispatchEvent(dragEnter);
+              target.dispatchEvent(dragOver);
+              target.dispatchEvent(drop);
+              return {
+                success: true,
+                method: "drag_and_drop",
+                dropTarget: {
+                  coordinate: [x, y],
+                  element: target === document.body ? "document area" : target.tagName.toLowerCase(),
+                },
+                uploadedFile: {
+                  name: file.name,
+                  size: file.size,
+                  mimeType: file.type,
+                },
+              };
+            });
+          })()`
+        );
+      }
+      result = result ?? { success: false as const, error: "Failed to upload image by coordinate." };
 
       if (!result.success) {
         return fail(result.error, { coordinate: point });
@@ -5492,6 +6398,8 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call resize_window with width, height, and tabId when user asks to resize viewport/window. " +
         "Call get_page_text with tabId and optional max_chars to read plain text content from pages. " +
         "Call javascript_tool with action='javascript_exec', text, and tabId when user asks to run JavaScript on a page. " +
+        "For keyboard-testing tasks (e.g., 'press keys', key-test websites), prefer real key events via computer action 'key' or 'type' in key-event mode; do not rely on plain text insertion. " +
+        "Do not claim keys were pressed successfully unless a follow-up check indicates the page reacted (e.g., changed state/text or expected navigation). " +
         "When the user gives a direct imperative task (especially phrasing like 'no questions asked' or 'should not fail'), execute end-to-end without asking for confirmation. " +
         "If an interaction fails, autonomously retry with up to 3 alternative strategies (refresh refs/find, hover then click, click a more specific matching element) before reporting failure. " +
         "For page location use window.location.href. Prefer scripts that return a value."

@@ -114,7 +114,11 @@ async function runGraph() {
     return;
   }
 
-  const threadId = threadInput.value.trim() || "default-thread";
+  let threadId = threadInput.value.trim();
+  if (!threadId) {
+    threadId = crypto.randomUUID();
+    threadInput.value = threadId;
+  }
   const input = promptInput.value.trim();
 
   if (!input) {
@@ -232,4 +236,5 @@ newThreadButton.addEventListener("click", () => {
 
 setDebugPanelVisible(false);
 renderMessages([]);
+threadInput.value = crypto.randomUUID();
 setRunState(false);
