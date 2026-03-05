@@ -2,286 +2,296 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>UI Action Test Page</title>
+<title>Job Application</title>
+
 <style>
-  body {
-    font-family: sans-serif;
-    margin: 30px;
-  }
-  section {
-    margin-bottom: 40px;
-    border: 1px solid #ccc;
-    padding: 15px;
-  }
-  .hover-box {
-    width: 150px;
-    height: 100px;
-    background: #eef;
-    line-height: 100px;
-    text-align: center;
-    transition: background 0.3s;
-  }
-  .hover-box:hover {
-    background: #cfc;
-  }
-  .drag-area {
-    width: 200px;
-    height: 100px;
-    background: #fdd;
-    position: relative;
-  }
-  .draggable {
-    width: 50px;
-    height: 50px;
-    background: #d77;
-    position: absolute;
-    top: 25px;
-    left: 25px;
-    cursor: grab;
-  }
-  .drop-zone {
-    width: 300px;
-    height: 200px;
-    border: 2px dashed #aaa;
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #888;
-    font-size: 14px;
-    transition: background 0.2s, border-color 0.2s;
-    overflow: hidden;
-  }
-  .drop-zone.dragover {
-    background: #e8f5e9;
-    border-color: #4caf50;
-    color: #4caf50;
-  }
-  .drop-zone img {
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
-  }
-  .spacer {
-    height: 800px; /* for scroll testing */
-  }
+
+body{
+font-family: Arial;
+background:#f5f6fa;
+margin:0;
+}
+
+.container{
+width:650px;
+margin:40px auto;
+background:white;
+padding:30px;
+border-radius:8px;
+box-shadow:0 0 10px rgba(0,0,0,0.1);
+}
+
+h2{
+margin-top:0;
+}
+
+.field{
+margin-bottom:18px;
+}
+
+label{
+display:block;
+font-weight:bold;
+margin-bottom:6px;
+}
+
+input,select,textarea{
+width:100%;
+padding:10px;
+border:1px solid #ccc;
+border-radius:4px;
+}
+
+button{
+padding:12px 20px;
+background:#2d6cdf;
+color:white;
+border:none;
+border-radius:5px;
+cursor:pointer;
+}
+
+button:hover{
+background:#1e4fb8;
+}
+
+.hidden{
+display:none;
+}
+
+.error{
+color:red;
+font-weight:bold;
+}
+
+.success{
+color:green;
+font-weight:bold;
+}
+
 </style>
 </head>
+
 <body>
 
-<h1>Interaction Test Page</h1>
+<div class="container">
 
-<section id="click-tests">
-  <h2>Click Tests</h2>
-  <button id="leftClickBtn">Left Click Me</button>
-  <button id="rightClickBtn">Right Click Me</button>
-  <button id="doubleClickBtn">Double Click Me</button>
-  <button id="tripleClickBtn">Triple Click Me</button>
-  <p id="clickOutput">Action: (none)</p>
-</section>
+<h2>Software Engineer Application</h2>
 
-<section id="typing-tests">
-  <h2>Typing Test</h2>
-  <input type="text" id="textInput" placeholder="Type here..." />
-  <p id="typedOutput"></p>
-</section>
+<form id="jobForm">
 
-<section id="hover-tests">
-  <h2>Hover Test</h2>
-  <div class="hover-box" id="hoverBox">Hover over me</div>
-</section>
+<div class="field">
+<label>Full Name</label>
+<input type="text" id="name" required>
+</div>
 
-<section id="drag-tests">
-  <h2>Drag Test</h2>
-  <div class="drag-area" id="dragArea">
-    <div class="draggable" id="draggable"></div>
-  </div>
-</section>
+<div class="field">
+<label>Email</label>
+<input type="email" id="email" required>
+</div>
 
-<section id="file-select-tests">
-  <h2>File Select Test</h2>
-  <input type="file" id="fileInput" />
-  <p id="fileOutput">No file selected</p>
-</section>
+<div class="field">
+<label>Years of Experience</label>
+<select id="experience">
+<option value="">Select</option>
+<option>0-1</option>
+<option>2-4</option>
+<option>5+</option>
+</select>
+</div>
 
-<section id="image-drop-tests">
-  <h2>Image Drag & Drop Test</h2>
-  <div class="drop-zone" id="dropZone">Drag & drop an image here</div>
-  <p id="dropOutput">No image dropped</p>
-</section>
+<div id="seniorFields" class="hidden">
 
-<section id="network-tests">
-  <h2>Network Request Tests</h2>
-  <button id="netSuccessBtn">GET (200 OK)</button>
-  <button id="net404Btn">GET (404 Not Found)</button>
-  <button id="net500Btn">GET (500 Server Error)</button>
-  <button id="netCorsBtn">GET (CORS Fail)</button>
-  <button id="netPostBtn">POST (200 OK)</button>
-  <button id="netTimeoutBtn">GET (Timeout)</button>
-  <p id="networkOutput">Status: (none)</p>
-</section>
+<div class="field">
+<label>Architecture Experience (years)</label>
+<input type="number" id="architecture">
+</div>
 
-<section id="scroll-tests">
-  <h2>Scroll Test</h2>
-  <div class="spacer"></div>
-  <p>You scrolled all the way down. 🎯</p>
-</section>
+<div class="field">
+<label>Team Size Managed</label>
+<input type="number" id="teamSize">
+</div>
+
+</div>
+
+<div class="field">
+<label>Primary Skill</label>
+<select id="skill">
+<option value="">Select</option>
+<option>Frontend</option>
+<option>Backend</option>
+<option>Data</option>
+</select>
+</div>
+
+<div id="dynamicSkill"></div>
+
+<div class="field">
+<label>Why should we hire you?</label>
+<textarea id="reason" rows="4"></textarea>
+</div>
+
+<!-- Honeypot Field -->
+<div style="display:none">
+<input type="text" id="companyWebsite">
+</div>
+
+<div class="field">
+<label>
+<input type="checkbox" id="humanCheck">
+I confirm I manually filled this form
+</label>
+</div>
+
+<div class="field">
+<button type="submit">Submit Application</button>
+</div>
+
+<div id="msg"></div>
+
+</form>
+
+</div>
 
 <script>
-  // Click tests
-  const output = document.getElementById('clickOutput');
-  document.getElementById('leftClickBtn').addEventListener('click', () => output.textContent = 'Action: Left click');
-  document.getElementById('rightClickBtn').addEventListener('contextmenu', (e) => {
-    e.preventDefault();
-    output.textContent = 'Action: Right click';
-  });
-  document.getElementById('doubleClickBtn').addEventListener('dblclick', () => output.textContent = 'Action: Double click');
 
-  // Triple click detection (quick 3 left clicks)
-  const tripleBtn = document.getElementById('tripleClickBtn');
-  let clickCount = 0;
-  let clickTimer;
-  tripleBtn.addEventListener('click', () => {
-    clickCount++;
-    clearTimeout(clickTimer);
-    clickTimer = setTimeout(() => clickCount = 0, 400);
-    if (clickCount === 3) {
-      output.textContent = 'Action: Triple click';
-      clickCount = 0;
-    }
-  });
+/* behavior tracking */
 
-  // Typing test
-  const input = document.getElementById('textInput');
-  const typedOutput = document.getElementById('typedOutput');
-  input.addEventListener('input', () => {
-    typedOutput.textContent = 'You typed: ' + input.value;
-    console.log('Typing input changed: ' + input.value);
-    console.warn('Warning: user is typing in the input field');
-    console.error('Error: simulated error for typing event');
-  });
+let formLoadTime = Date.now()
+let mouseMoves = 0
+let pasted = false
 
-  // Drag-and-drop
-  const draggable = document.getElementById('draggable');
-  const area = document.getElementById('dragArea');
-  let isDragging = false;
-  draggable.addEventListener('mousedown', e => { isDragging = true; });
-  window.addEventListener('mouseup', e => { isDragging = false; });
-  window.addEventListener('mousemove', e => {
-    if (!isDragging) return;
-    const rect = area.getBoundingClientRect();
-    const x = e.clientX - rect.left - draggable.clientWidth / 2;
-    const y = e.clientY - rect.top - draggable.clientHeight / 2;
-    draggable.style.left = Math.max(0, Math.min(rect.width - draggable.clientWidth, x)) + 'px';
-    draggable.style.top = Math.max(0, Math.min(rect.height - draggable.clientHeight, y)) + 'px';
-  });
+document.addEventListener("mousemove",()=>mouseMoves++)
 
-  // File select
-  const fileInput = document.getElementById('fileInput');
-  const fileOutput = document.getElementById('fileOutput');
-  fileInput.addEventListener('change', () => {
-    const file = fileInput.files[0];
-    if (file) {
-      fileOutput.textContent = 'Selected: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
-    } else {
-      fileOutput.textContent = 'No file selected';
-    }
-  });
+document.getElementById("reason").addEventListener("paste",()=>{
+pasted = true
+})
 
-  // Image drag & drop
-  const dropZone = document.getElementById('dropZone');
-  const dropOutput = document.getElementById('dropOutput');
+/* conditional experience fields */
 
-  dropZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    dropZone.classList.add('dragover');
-  });
-  dropZone.addEventListener('dragleave', () => {
-    dropZone.classList.remove('dragover');
-  });
-  dropZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    dropZone.classList.remove('dragover');
-    const file = e.dataTransfer.files[0];
-    if (file && file.type.startsWith('image/')) {
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        dropZone.innerHTML = '';
-        const img = document.createElement('img');
-        img.src = ev.target.result;
-        dropZone.appendChild(img);
-      };
-      reader.readAsDataURL(file);
-      dropOutput.textContent = 'Dropped: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
-    } else {
-      dropOutput.textContent = 'Please drop an image file.';
-    }
-  });
+document.getElementById("experience").addEventListener("change",function(){
 
-  // Network request tests
-  const networkOutput = document.getElementById('networkOutput');
+let val = this.value
+let senior = document.getElementById("seniorFields")
 
-  function updateNetStatus(label, response) {
-    networkOutput.textContent = 'Status: ' + label + ' — ' + response;
-  }
+if(val==="5+"){
+senior.classList.remove("hidden")
+}else{
+senior.classList.add("hidden")
+}
 
-  // 200 OK - successful GET
-  document.getElementById('netSuccessBtn').addEventListener('click', () => {
-    networkOutput.textContent = 'Status: Fetching...';
-    fetch('https://httpbin.org/get')
-      .then(r => updateNetStatus('GET /get', r.status + ' ' + r.statusText))
-      .catch(e => updateNetStatus('GET /get', 'Error: ' + e.message));
-  });
+})
 
-  // 404 Not Found
-  document.getElementById('net404Btn').addEventListener('click', () => {
-    networkOutput.textContent = 'Status: Fetching...';
-    fetch('https://httpbin.org/status/404')
-      .then(r => updateNetStatus('GET /status/404', r.status + ' ' + r.statusText))
-      .catch(e => updateNetStatus('GET /status/404', 'Error: ' + e.message));
-  });
+/* dynamic skill fields */
 
-  // 500 Server Error
-  document.getElementById('net500Btn').addEventListener('click', () => {
-    networkOutput.textContent = 'Status: Fetching...';
-    fetch('https://httpbin.org/status/500')
-      .then(r => updateNetStatus('GET /status/500', r.status + ' ' + r.statusText))
-      .catch(e => updateNetStatus('GET /status/500', 'Error: ' + e.message));
-  });
+document.getElementById("skill").addEventListener("change",function(){
 
-  // CORS failure - request to a non-CORS endpoint
-  document.getElementById('netCorsBtn').addEventListener('click', () => {
-    networkOutput.textContent = 'Status: Fetching...';
-    fetch('https://www.google.com/', { mode: 'cors' })
-      .then(r => updateNetStatus('GET google.com (CORS)', r.status + ' ' + r.statusText))
-      .catch(e => updateNetStatus('GET google.com (CORS)', 'Error: ' + e.message));
-  });
+let container = document.getElementById("dynamicSkill")
+container.innerHTML=""
 
-  // POST request - successful
-  document.getElementById('netPostBtn').addEventListener('click', () => {
-    networkOutput.textContent = 'Status: Fetching...';
-    fetch('https://httpbin.org/post', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ test: true, message: 'hello' })
-    })
-      .then(r => updateNetStatus('POST /post', r.status + ' ' + r.statusText))
-      .catch(e => updateNetStatus('POST /post', 'Error: ' + e.message));
-  });
+let skill = this.value
 
-  // Timeout - delayed response with AbortController
-  document.getElementById('netTimeoutBtn').addEventListener('click', () => {
-    networkOutput.textContent = 'Status: Fetching (will timeout in 2s)...';
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 2000);
-    fetch('https://httpbin.org/delay/10', { signal: controller.signal })
-      .then(r => updateNetStatus('GET /delay/10', r.status + ' ' + r.statusText))
-      .catch(e => updateNetStatus('GET /delay/10 (Timeout)', 'Error: ' + e.message));
-  });
+if(skill==="Frontend"){
 
-  // Hover visual feedback (already CSS)
-  document.getElementById('hoverBox').addEventListener('mouseenter', () => console.log('Hover started'));
-  document.getElementById('hoverBox').addEventListener('mouseleave', () => console.log('Hover ended'));
+container.innerHTML = `
+<div class="field">
+<label>Favorite JS Framework</label>
+<input type="text" id="framework">
+</div>
+`
+
+}
+
+if(skill==="Backend"){
+
+container.innerHTML = `
+<div class="field">
+<label>Preferred Backend Language</label>
+<input type="text" id="backendLang">
+</div>
+`
+
+}
+
+if(skill==="Data"){
+
+container.innerHTML = `
+<div class="field">
+<label>ML Experience (years)</label>
+<input type="number" id="mlExp">
+</div>
+`
+
+}
+
+})
+
+/* random hidden math challenge */
+
+let challengeA = Math.floor(Math.random()*10)+1
+let challengeB = Math.floor(Math.random()*10)+1
+let challengeAnswer = challengeA + challengeB
+
+let hiddenInput = document.createElement("input")
+hiddenInput.type="hidden"
+hiddenInput.id="humanMath"
+hiddenInput.value=challengeAnswer
+
+document.getElementById("jobForm").appendChild(hiddenInput)
+
+/* submit logic */
+
+document.getElementById("jobForm").addEventListener("submit",function(e){
+
+e.preventDefault()
+
+let msg = document.getElementById("msg")
+msg.innerHTML=""
+
+let timeSpent = (Date.now() - formLoadTime)/1000
+
+let isBot = false
+
+/* honeypot */
+
+if(document.getElementById("companyWebsite").value!==""){
+isBot = true
+}
+
+/* too fast */
+
+if(timeSpent < 4){
+isBot = true
+}
+
+/* no mouse movement */
+
+if(mouseMoves < 10){
+isBot = true
+}
+
+/* pasted content */
+
+if(pasted){
+isBot = true
+}
+
+/* human checkbox */
+
+if(!document.getElementById("humanCheck").checked){
+isBot = true
+}
+
+/* result */
+
+if(isBot){
+msg.innerHTML="<p class='error'>Submitted by bot</p>"
+}else{
+msg.innerHTML="<p class='success'>Application submitted successfully</p>"
+}
+
+})
+
 </script>
 
 </body>

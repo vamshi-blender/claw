@@ -232,6 +232,8 @@ type TabLockState = {
 const tabActionLocks = new Map<number, TabLockState>();
 const screenshotStore = new Map<string, StoredScreenshot>();
 const MAX_STORED_SCREENSHOTS = 30;
+const ENABLE_VISION_SCREENSHOT_CONTEXT = true; // Set false to disable sending screenshots to the model (costly).
+const MAX_VISION_SCREENSHOT_DATA_URL_CHARS = 2_000_000;
 let screenshotCounter = 0;
 
 const MODIFIER_BITS: Record<ModifierName, number> = {
@@ -3294,14 +3296,47 @@ const readPageTool = tool(
           return tag;
         };
 
+        const getVisibilityInfo = (el) => {
+          if (!(el instanceof Element)) {
+            return { visible: false, reason: "not_element" };
+          }
+
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          const reasons = [];
+
+          if (el.hasAttribute("hidden")) reasons.push("hidden_attr");
+          if ((el.getAttribute("aria-hidden") || "").toLowerCase() === "true") reasons.push("aria_hidden");
+          if (el instanceof HTMLInputElement && (el.type || "").toLowerCase() === "hidden") reasons.push("input_hidden_type");
+          if (style.display === "none") reasons.push("display_none");
+          if (style.visibility === "hidden" || style.visibility === "collapse") reasons.push("visibility_hidden");
+          if (Number(style.opacity) === 0) reasons.push("opacity_0");
+          if (rect.width <= 0 || rect.height <= 0) reasons.push("zero_size");
+
+          const viewportWidth = Math.max(document.documentElement?.clientWidth || 0, window.innerWidth || 0);
+          const viewportHeight = Math.max(document.documentElement?.clientHeight || 0, window.innerHeight || 0);
+          if (rect.bottom < 0 || rect.right < 0 || rect.top > viewportHeight || rect.left > viewportWidth) {
+            reasons.push("offscreen");
+          }
+
+          const visible = reasons.length === 0;
+          return {
+            visible,
+            reason: visible ? "visible" : reasons.join("|"),
+          };
+        };
+
         const toCompactNode = (el) => {
           if (!(el instanceof Element)) return null;
           const path = buildPath(el);
           if (!path) return null;
+          const visibility = getVisibilityInfo(el);
           const node = {
             ref: "ref_" + refHash(path),
             type: getType(el),
+            visible: visibility.visible,
           };
+          if (!visibility.visible) node.visibilityReason = visibility.reason;
           const name = getNodeName(el);
           if (name) node.name = name;
           if (el instanceof HTMLInputElement) {
@@ -3350,10 +3385,13 @@ const readPageTool = tool(
         const buildNode = (el, currentDepth, path) => {
           if (!(el instanceof Element)) return null;
           const ref = "ref_" + refHash(path);
+          const visibility = getVisibilityInfo(el);
           const node = {
             ref,
             type: getType(el),
+            visible: visibility.visible,
           };
+          if (!visibility.visible) node.visibilityReason = visibility.reason;
 
           const name = getNodeName(el);
           if (name) node.name = name;
@@ -3565,6 +3603,31 @@ const readPageTool = tool(
               if (tag === "a") return "link";
               return tag;
             };
+            const getVisibilityInfo = (el) => {
+              if (!(el instanceof Element)) {
+                return { visible: false, reason: "not_element" };
+              }
+              const style = window.getComputedStyle(el);
+              const rect = el.getBoundingClientRect();
+              const reasons = [];
+              if (el.hasAttribute("hidden")) reasons.push("hidden_attr");
+              if ((el.getAttribute("aria-hidden") || "").toLowerCase() === "true") reasons.push("aria_hidden");
+              if (el instanceof HTMLInputElement && (el.type || "").toLowerCase() === "hidden") reasons.push("input_hidden_type");
+              if (style.display === "none") reasons.push("display_none");
+              if (style.visibility === "hidden" || style.visibility === "collapse") reasons.push("visibility_hidden");
+              if (Number(style.opacity) === 0) reasons.push("opacity_0");
+              if (rect.width <= 0 || rect.height <= 0) reasons.push("zero_size");
+              const viewportWidth = Math.max(document.documentElement?.clientWidth || 0, window.innerWidth || 0);
+              const viewportHeight = Math.max(document.documentElement?.clientHeight || 0, window.innerHeight || 0);
+              if (rect.bottom < 0 || rect.right < 0 || rect.top > viewportHeight || rect.left > viewportWidth) {
+                reasons.push("offscreen");
+              }
+              const visible = reasons.length === 0;
+              return {
+                visible,
+                reason: visible ? "visible" : reasons.join("|"),
+              };
+            };
             const selectors = ["input", "textarea", "select", "button", "a[href]", "[role='button']", "[role='link']", "[contenteditable='true']"];
             const elements = Array.from(document.querySelectorAll(selectors.join(",")));
             const seen = new Set();
@@ -3574,7 +3637,13 @@ const readPageTool = tool(
               const path = buildPath(el);
               if (!path || seen.has(path)) continue;
               seen.add(path);
-              const node = { ref: "ref_" + refHash(path), type: getType(el) };
+              const visibility = getVisibilityInfo(el);
+              const node = {
+                ref: "ref_" + refHash(path),
+                type: getType(el),
+                visible: visibility.visible,
+              };
+              if (!visibility.visible) node.visibilityReason = visibility.reason;
               const name = getName(el);
               if (name) node.name = name;
               if (el instanceof HTMLInputElement) {
@@ -3639,7 +3708,7 @@ const readPageTool = tool(
   {
     name: "read_page",
     description:
-      "Read page structure as a ref-based tree. Supports tabId, optional depth (default 15), filter ('all'|'interactive'), max_chars (default 50000), and ref_id for focused subtree reads.",
+      "Read page structure as a ref-based tree, including per-element visibility metadata (visible, visibilityReason). Supports tabId, optional depth (default 15), filter ('all'|'interactive'), max_chars (default 50000), and ref_id for focused subtree reads.",
     schema: z.object({
       tabId: z.number().int().describe("Tab ID to read from. Must be in current tab group/context."),
       depth: z.number().int().positive().optional().describe("Maximum traversal depth. Defaults to 15."),
@@ -4731,63 +4800,136 @@ const computerTool = tool(
     name: "computer",
     description:
       "Use mouse/keyboard actions and screenshots on a tab. Supports left/right/double/triple click, type, screenshot, wait, scroll, key, left_click_drag, zoom, scroll_to, and hover.",
-    schema: z.object({
-      action: z
-        .enum(COMPUTER_ACTIONS)
-        .describe(
-          "Action to perform. Options: left_click, right_click, double_click, triple_click, type, screenshot, wait, scroll, key, left_click_drag, zoom, scroll_to, hover."
-        ),
-      tabId: z.number().int().describe("Tab ID to execute action on. Must be in current tab group/context."),
-      coordinate: z
-        .array(z.number())
-        .length(2)
-        .optional()
-        .describe(
-          "Viewport coordinates [x, y]. Required for click/right_click/double_click/triple_click/scroll. Used as end position for left_click_drag."
-        ),
-      duration: z.number().optional().describe("Wait duration in seconds for action='wait'. Maximum 30."),
-      modifiers: z
-        .string()
-        .optional()
-        .describe(
-          "Modifier keys (ctrl, shift, alt, cmd/meta, win/windows). Combine with '+' (e.g., ctrl+shift)."
-        ),
-      ref: z
-        .string()
-        .optional()
-        .describe(
-          "Element ref from read_page/find. Required for scroll_to, and usable as alternative to coordinate for click/hover."
-        ),
-      region: z
-        .array(z.number())
-        .length(4)
-        .optional()
-        .describe("Zoom region [x0, y0, x1, y1], required for action='zoom'."),
-      repeat: z
-        .number()
-        .int()
-        .optional()
-        .describe("Repeat count for action='key'. Integer between 1 and 100, default 1."),
-      scroll_amount: z
-        .number()
-        .optional()
-        .describe("Number of scroll ticks for action='scroll'. Defaults to 3."),
-      scroll_direction: z
-        .enum(["up", "down", "left", "right"])
-        .optional()
-        .describe("Scroll direction for action='scroll'."),
-      start_coordinate: z
-        .array(z.number())
-        .length(2)
-        .optional()
-        .describe("Start coordinate [x, y] for action='left_click_drag'."),
-      text: z
-        .string()
-        .optional()
-        .describe(
-          "Text for action='type', or key sequence for action='key'. Key sequences are space-separated (e.g., 'Backspace Backspace Delete' or 'ctrl+a')."
-        ),
-    }),
+    schema: z
+      .object({
+        action: z
+          .enum(COMPUTER_ACTIONS)
+          .describe(
+            "Action to perform. Options: left_click, right_click, double_click, triple_click, type, screenshot, wait, scroll, key, left_click_drag, zoom, scroll_to, hover."
+          ),
+        tabId: z.number().int().describe("Tab ID to execute action on. Must be in current tab group/context."),
+        coordinate: z
+          .array(z.number())
+          .length(2)
+          .optional()
+          .describe(
+            "Viewport coordinates [x, y]. Required for click/right_click/double_click/triple_click/scroll. Used as end position for left_click_drag."
+          ),
+        duration: z.number().optional().describe("Wait duration in seconds for action='wait'. Maximum 30."),
+        modifiers: z
+          .string()
+          .optional()
+          .describe(
+            "Modifier keys (ctrl, shift, alt, cmd/meta, win/windows). Combine with '+' (e.g., ctrl+shift)."
+          ),
+        ref: z
+          .string()
+          .optional()
+          .describe(
+            "Element ref from read_page/find. Required for scroll_to, and usable as alternative to coordinate for click/hover."
+          ),
+        region: z
+          .array(z.number())
+          .length(4)
+          .optional()
+          .describe("Zoom region [x0, y0, x1, y1], required for action='zoom'."),
+        repeat: z
+          .number()
+          .int()
+          .optional()
+          .describe("Repeat count for action='key'. Integer between 1 and 100, default 1."),
+        scroll_amount: z
+          .number()
+          .optional()
+          .describe("Number of scroll ticks for action='scroll'. Defaults to 3."),
+        scroll_direction: z
+          .enum(["up", "down", "left", "right"])
+          .optional()
+          .describe("Scroll direction for action='scroll'."),
+        start_coordinate: z
+          .array(z.number())
+          .length(2)
+          .optional()
+          .describe("Start coordinate [x, y] for action='left_click_drag'."),
+        text: z
+          .string()
+          .optional()
+          .describe(
+            "Text for action='type', or key sequence for action='key'. Key sequences are space-separated (e.g., 'Backspace Backspace Delete' or 'ctrl+a')."
+          ),
+      })
+      .superRefine((data, ctx) => {
+        const hasCoordinate = Array.isArray(data.coordinate) && data.coordinate.length === 2;
+        const hasStartCoordinate = Array.isArray(data.start_coordinate) && data.start_coordinate.length === 2;
+        const hasRef = typeof data.ref === "string" && data.ref.trim().length > 0;
+        const hasText = typeof data.text === "string" && data.text.trim().length > 0;
+        const hasDuration = typeof data.duration === "number";
+        const hasScrollDirection = typeof data.scroll_direction === "string";
+        const hasRegion = Array.isArray(data.region) && data.region.length === 4;
+
+        if (data.action === "scroll_to" && !hasRef) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "action='scroll_to' requires 'ref'.",
+            path: ["ref"],
+          });
+        }
+        if (data.action === "scroll" && !hasCoordinate) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "action='scroll' requires 'coordinate'.",
+            path: ["coordinate"],
+          });
+        }
+        if (data.action === "scroll" && !hasScrollDirection) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "action='scroll' requires 'scroll_direction'.",
+            path: ["scroll_direction"],
+          });
+        }
+        if (data.action === "wait" && !hasDuration) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "action='wait' requires 'duration'.",
+            path: ["duration"],
+          });
+        }
+        if ((data.action === "type" || data.action === "key") && !hasText) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `action='${data.action}' requires non-empty 'text'.`,
+            path: ["text"],
+          });
+        }
+        if (data.action === "left_click_drag" && (!hasCoordinate || !hasStartCoordinate)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "action='left_click_drag' requires both 'start_coordinate' and 'coordinate'.",
+          });
+        }
+        if (data.action === "zoom" && !hasRegion) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "action='zoom' requires 'region'.",
+            path: ["region"],
+          });
+        }
+        if (
+          (data.action === "left_click" ||
+            data.action === "right_click" ||
+            data.action === "double_click" ||
+            data.action === "triple_click" ||
+            data.action === "hover") &&
+          !hasCoordinate &&
+          !hasRef
+        ) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `action='${data.action}' requires either 'coordinate' or 'ref'.`,
+          });
+        }
+      }),
   }
 );
 
@@ -5486,27 +5628,38 @@ const uploadImageTool = tool(
     name: "upload_image",
     description:
       "Upload a stored image (from computer screenshot/zoom) to a target element via ref or coordinate drag-drop. Requires imageId and tabId, plus exactly one of ref or coordinate.",
-    schema: z.object({
-      imageId: z
-        .string()
-        .min(1)
-        .describe("Image ID from computer screenshot/zoom or supported uploaded image IDs."),
-      tabId: z.number().int().describe("Tab ID where the upload target is located."),
-      ref: z
-        .string()
-        .optional()
-        .describe(
-          "Element reference ID from read_page/find. Use for file inputs or specific elements. Provide either ref or coordinate."
-        ),
-      coordinate: z
-        .array(z.number())
-        .length(2)
-        .optional()
-        .describe(
-          "Viewport coordinate [x, y] for drag-and-drop targets. Provide either coordinate or ref."
-        ),
-      filename: z.string().optional().describe("Optional uploaded filename. Defaults to image.png."),
-    }),
+    schema: z
+      .object({
+        imageId: z
+          .string()
+          .min(1)
+          .describe("Image ID from computer screenshot/zoom or supported uploaded image IDs."),
+        tabId: z.number().int().describe("Tab ID where the upload target is located."),
+        ref: z
+          .string()
+          .optional()
+          .describe(
+            "Element reference ID from read_page/find. Use for file inputs or specific elements. Provide either ref or coordinate."
+          ),
+        coordinate: z
+          .array(z.number())
+          .length(2)
+          .optional()
+          .describe(
+            "Viewport coordinate [x, y] for drag-and-drop targets. Provide either coordinate or ref."
+          ),
+        filename: z.string().optional().describe("Optional uploaded filename. Defaults to image.png."),
+      })
+      .superRefine((data, ctx) => {
+        const hasRef = typeof data.ref === "string" && data.ref.trim().length > 0;
+        const hasCoordinate = Array.isArray(data.coordinate) && data.coordinate.length === 2;
+        if (hasRef === hasCoordinate) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Provide exactly one of 'ref' or 'coordinate' (not both).",
+          });
+        }
+      }),
   }
 );
 
@@ -5836,6 +5989,332 @@ const javascriptTool = tool(
   }
 );
 
+type ToolValidationError = {
+  toolName: string;
+  message: string;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function hasNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function hasCoordinateTuple(value: unknown): value is [number, number] {
+  return Array.isArray(value) && value.length === 2 && value.every((x) => typeof x === "number");
+}
+
+function validateToolCallArgs(toolName: string, rawArgs: unknown): ToolValidationError[] {
+  const errors: ToolValidationError[] = [];
+  const args = isRecord(rawArgs) ? rawArgs : {};
+
+  const requireInt = (field: string) => {
+    const value = args[field];
+    if (!(typeof value === "number" && Number.isInteger(value))) {
+      errors.push({ toolName, message: `Parameter '${field}' is required and must be an integer.` });
+    }
+  };
+
+  switch (toolName) {
+    case "tabs_context":
+    case "tabs_create":
+    case "turn_answer_start":
+      return errors;
+    case "navigate":
+      requireInt("tabId");
+      if (!hasNonEmptyString(args.url)) {
+        errors.push({ toolName, message: "Parameter 'url' is required." });
+      }
+      return errors;
+    case "resize_window":
+      requireInt("tabId");
+      requireInt("width");
+      requireInt("height");
+      return errors;
+    case "get_page_text":
+      requireInt("tabId");
+      return errors;
+    case "read_page":
+      requireInt("tabId");
+      return errors;
+    case "find":
+      requireInt("tabId");
+      if (!hasNonEmptyString(args.query)) {
+        errors.push({ toolName, message: "Parameter 'query' is required." });
+      }
+      return errors;
+    case "form_input": {
+      requireInt("tabId");
+      const hasRef = hasNonEmptyString(args.ref);
+      const hasValue = Object.prototype.hasOwnProperty.call(args, "value");
+      const hasInputs = Array.isArray(args.inputs) && args.inputs.length > 0;
+      if (!hasInputs && !(hasRef && hasValue)) {
+        errors.push({
+          toolName,
+          message: "Provide either both 'ref' and 'value' or a non-empty 'inputs' array.",
+        });
+      }
+      if (hasInputs && (hasRef || hasValue)) {
+        errors.push({
+          toolName,
+          message: "Use either single-input mode ('ref' + 'value') or batch mode ('inputs'), not both.",
+        });
+      }
+      return errors;
+    }
+    case "computer": {
+      requireInt("tabId");
+      if (!hasNonEmptyString(args.action)) {
+        errors.push({ toolName, message: "Parameter 'action' is required." });
+        return errors;
+      }
+
+      const action = args.action;
+      const hasCoordinate = hasCoordinateTuple(args.coordinate);
+      const hasStart = hasCoordinateTuple(args.start_coordinate);
+      const hasRef = hasNonEmptyString(args.ref);
+      const hasText = hasNonEmptyString(args.text);
+      const hasDuration = typeof args.duration === "number";
+      const hasRegion = Array.isArray(args.region) && args.region.length === 4;
+
+      if (action === "scroll_to" && !hasRef) {
+        errors.push({ toolName, message: "Parameter 'ref' is required for action 'scroll_to'." });
+      }
+      if (action === "scroll") {
+        if (!hasCoordinate) {
+          errors.push({ toolName, message: "Parameter 'coordinate' is required for action 'scroll'." });
+        }
+        if (!hasNonEmptyString(args.scroll_direction)) {
+          errors.push({ toolName, message: "Parameter 'scroll_direction' is required for action 'scroll'." });
+        }
+      }
+      if (action === "wait" && !hasDuration) {
+        errors.push({ toolName, message: "Parameter 'duration' is required for action 'wait'." });
+      }
+      if ((action === "type" || action === "key") && !hasText) {
+        errors.push({ toolName, message: `Parameter 'text' is required for action '${action}'.` });
+      }
+      if (action === "left_click_drag" && (!hasCoordinate || !hasStart)) {
+        errors.push({
+          toolName,
+          message: "Parameters 'start_coordinate' and 'coordinate' are required for action 'left_click_drag'.",
+        });
+      }
+      if (action === "zoom" && !hasRegion) {
+        errors.push({ toolName, message: "Parameter 'region' is required for action 'zoom'." });
+      }
+      if (
+        (action === "left_click" ||
+          action === "right_click" ||
+          action === "double_click" ||
+          action === "triple_click" ||
+          action === "hover") &&
+        !hasCoordinate &&
+        !hasRef
+      ) {
+        errors.push({ toolName, message: `Action '${action}' requires either 'coordinate' or 'ref'.` });
+      }
+      return errors;
+    }
+    case "upload_image": {
+      requireInt("tabId");
+      if (!hasNonEmptyString(args.imageId)) {
+        errors.push({ toolName, message: "Parameter 'imageId' is required." });
+      }
+      const hasRef = hasNonEmptyString(args.ref);
+      const hasCoordinate = hasCoordinateTuple(args.coordinate);
+      if (hasRef === hasCoordinate) {
+        errors.push({ toolName, message: "Provide exactly one of 'ref' or 'coordinate'." });
+      }
+      return errors;
+    }
+    case "file_upload":
+      requireInt("tabId");
+      if (!hasNonEmptyString(args.ref)) {
+        errors.push({ toolName, message: "Parameter 'ref' is required." });
+      }
+      if (!(Array.isArray(args.paths) && args.paths.length > 0)) {
+        errors.push({ toolName, message: "Parameter 'paths' is required and must be a non-empty array." });
+      }
+      return errors;
+    case "read_console_messages":
+      requireInt("tabId");
+      if (!hasNonEmptyString(args.pattern)) {
+        errors.push({ toolName, message: "Parameter 'pattern' is required." });
+      }
+      return errors;
+    case "read_network_requests":
+      requireInt("tabId");
+      return errors;
+    case "javascript_tool":
+      requireInt("tabId");
+      if (args.action !== "javascript_exec") {
+        errors.push({ toolName, message: "Parameter 'action' must be 'javascript_exec'." });
+      }
+      if (!hasNonEmptyString(args.text)) {
+        errors.push({ toolName, message: "Parameter 'text' is required." });
+      }
+      return errors;
+    default:
+      errors.push({ toolName, message: `Unknown tool '${toolName}'.` });
+      return errors;
+  }
+}
+
+function buildToolValidationErrorMessage(toolName: string, validationErrors: ToolValidationError[]) {
+  return JSON.stringify({
+    success: false,
+    action: toolName,
+    error: `Tool argument validation failed: ${validationErrors.map((e) => e.message).join(" ")}`,
+  });
+}
+
+function buildVisionContextMessageFromLastTool(messages: BaseMessage[]): HumanMessage | null {
+  const lastMessage = messages.at(-1);
+  if (!lastMessage || getMessageType(lastMessage) !== "tool") {
+    return null;
+  }
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(getTextContent(lastMessage.content)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  if (payload.success !== true) {
+    return null;
+  }
+
+  const action = typeof payload.action === "string" ? payload.action : "";
+  if (action !== "screenshot" && action !== "zoom") {
+    return null;
+  }
+
+  const imageId = typeof payload.imageId === "string" ? payload.imageId : "";
+  if (!imageId) {
+    return null;
+  }
+
+  const storedImage = screenshotStore.get(imageId);
+  if (!storedImage) {
+    return null;
+  }
+  if (storedImage.dataUrl.length > MAX_VISION_SCREENSHOT_DATA_URL_CHARS) {
+    return null;
+  }
+  if (!storedImage.dataUrl.startsWith("data:image/")) {
+    return null;
+  }
+
+  return new HumanMessage({
+    content: [
+      {
+        type: "text",
+        text:
+          `Latest browser ${storedImage.kind} for visual context ` +
+          `(imageId: ${storedImage.id}, tabId: ${storedImage.tabId}). ` +
+          "Use this image to understand the current screen before deciding the next action.",
+      },
+      {
+        type: "image_url",
+        image_url: {
+          url: storedImage.dataUrl,
+        },
+      },
+    ] as any,
+  });
+}
+
+type ParsedScrollResult = {
+  success: boolean;
+  action?: string;
+  tabId?: number;
+  direction?: string;
+  newScrollPosition?: number;
+};
+
+function parseScrollToolResult(message: BaseMessage): ParsedScrollResult | null {
+  if (getMessageType(message) !== "tool") {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(getTextContent(message.content)) as Record<string, unknown>;
+    if (parsed.action !== "scroll") {
+      return null;
+    }
+    return {
+      success: parsed.success === true,
+      action: typeof parsed.action === "string" ? parsed.action : undefined,
+      tabId: typeof parsed.tabId === "number" ? parsed.tabId : undefined,
+      direction: typeof parsed.direction === "string" ? parsed.direction : undefined,
+      newScrollPosition:
+        typeof parsed.newScrollPosition === "number" ? parsed.newScrollPosition : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function detectRedundantScrollCall(
+  messages: BaseMessage[],
+  toolName: string,
+  rawArgs: unknown
+): ToolValidationError[] {
+  if (toolName !== "computer" || !isRecord(rawArgs)) {
+    return [];
+  }
+  if (rawArgs.action !== "scroll") {
+    return [];
+  }
+
+  const tabId = typeof rawArgs.tabId === "number" ? rawArgs.tabId : undefined;
+  const direction = typeof rawArgs.scroll_direction === "string" ? rawArgs.scroll_direction : undefined;
+  if (!tabId || !direction) {
+    return [];
+  }
+
+  const scrollResults: ParsedScrollResult[] = [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const result = parseScrollToolResult(messages[i]);
+    if (!result || !result.success) {
+      continue;
+    }
+    if (result.tabId !== tabId || result.direction !== direction) {
+      continue;
+    }
+    scrollResults.push(result);
+    if (scrollResults.length === 2) {
+      break;
+    }
+  }
+
+  if (scrollResults.length < 2) {
+    return [];
+  }
+
+  const [latest, previous] = scrollResults;
+  if (
+    typeof latest.newScrollPosition === "number" &&
+    typeof previous.newScrollPosition === "number" &&
+    latest.newScrollPosition === previous.newScrollPosition
+  ) {
+    const edge = direction === "down" ? "bottom" : direction === "up" ? "top" : "edge";
+    return [
+      {
+        toolName,
+        message:
+          `Blocked redundant scroll: last two '${direction}' scroll calls had no position change ` +
+          `(${latest.newScrollPosition}). Likely at page ${edge}.`,
+      },
+    ];
+  }
+
+  return [];
+}
+
 const tools = [
   tabsContextTool,
   tabsCreateTool,
@@ -5853,7 +6332,44 @@ const tools = [
   javascriptTool,
   turnAnswerStartTool,
 ];
-const toolNode = new ToolNode(tools);
+const executionToolNode = new ToolNode(tools);
+const toolNode = async (state: typeof MessagesAnnotation.State) => {
+  const lastMessage = state.messages.at(-1);
+  if (!lastMessage || getMessageType(lastMessage) !== "ai") {
+    return { messages: [] };
+  }
+
+  const ai = lastMessage as unknown as {
+    tool_calls?: Array<{ id?: string; name?: string; args?: unknown }>;
+  };
+  if (!Array.isArray(ai.tool_calls) || ai.tool_calls.length === 0) {
+    return { messages: [] };
+  }
+
+  const validationMessages: ToolMessage[] = [];
+  for (const call of ai.tool_calls) {
+    const toolName = call.name ?? "unknown";
+    const validationErrors = [
+      ...validateToolCallArgs(toolName, call.args),
+      ...detectRedundantScrollCall(state.messages as BaseMessage[], toolName, call.args),
+    ];
+    if (validationErrors.length > 0) {
+      validationMessages.push(
+        new ToolMessage({
+          tool_call_id: call.id ?? crypto.randomUUID(),
+          name: toolName,
+          content: buildToolValidationErrorMessage(toolName, validationErrors),
+        })
+      );
+    }
+  }
+
+  if (validationMessages.length > 0) {
+    return { messages: validationMessages };
+  }
+
+  return executionToolNode.invoke(state);
+};
 const checkpointer = new MemorySaver();
 let fallbackSettings: LlmSettings | undefined;
 let fallbackAbortSignal: AbortSignal | undefined;
@@ -6387,8 +6903,7 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
     parallel_tool_calls: false,
   });
 
-  const response = await model.invoke(
-    [
+  const baseModelMessages: BaseMessage[] = [
       new SystemMessage(
         "You are BayMax, a Chrome extension browser assistant. You help users by browsing, reading, and interacting with web pages. Use tool calling to take actions — never guess or assume browser state. Respond concisely: start with a brief description (3 to 5 words) of what you're doing, then take action. If no action is needed, respond conversationally without calling tools. " +
         "Call tabs_context to get the current browser state (open tabs, active tab URL/title) BEFORE performing any tab-related action or when you need to know what tabs are open. Always call this first when the user references 'this page', 'current tab', 'my tabs', or any context-dependent request. Never assume tab state — always verify with tabs_context. " +
@@ -6397,7 +6912,13 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "Call find with tabId and a natural language query to locate matching elements quickly. " +
         "Call form_input to set form fields; use single mode (tabId, ref, value) or batch mode (tabId, inputs:[{ref,value},...]). " +
         "For multi-field forms, prefer batching independent fields in one call (text fields together, checkboxes together, radios together, selects together), then submit only after all required fields are filled. " +
+        "When filling forms, use read_page visibility metadata: do not fill inputs where visible=false unless the user explicitly asks. Treat hidden/offscreen unlabeled text fields as likely honeypots and leave them empty. " +
+        "For bot-sensitive form submissions, act human-like: do not submit immediately, include realistic interaction pacing (at least ~4 seconds total on page before submit), and generate several real mouse movements/hover interactions before clicking submit. " +
         "Call computer with action and tabId for mouse/keyboard interactions, scrolling, waiting, drag, hover, screenshots, and zoom. " +
+        "If a screenshot or zoom was just captured, an image message may be provided next; use it for visual understanding of the current screen. " +
+        "Before any computer call, ensure required parameters are present for the selected action. Never call computer action='scroll' without both coordinate and scroll_direction. Never call computer action='scroll_to' without ref. " +
+        "For requests like 'scroll to bottom/complete bottom', prefer: read_page -> identify bottom target ref -> computer action='scroll_to' with that ref. Use iterative scroll only when no suitable ref exists. " +
+        "If a scroll result shows no position change from the prior same-direction scroll, stop scrolling and respond (likely already at boundary). " +
         "Call upload_image with imageId and tabId plus exactly one of ref/coordinate to upload screenshots or images to file inputs or drag-drop targets. " +
         "Call file_upload with tabId, ref, and absolute local file paths to upload files directly to file input elements. " +
         "Call read_console_messages with tabId and pattern to inspect browser console logs; optionally use clear, limit, and onlyErrors. " +
@@ -6412,12 +6933,30 @@ const llmNode = async (state: typeof MessagesAnnotation.State) => {
         "If an interaction fails, autonomously retry with up to 3 alternative strategies (refresh refs/find, hover then click, click a more specific matching element) before reporting failure. " +
         "For page location use window.location.href. Prefer scripts that return a value."
       ),
-      ...state.messages,
-    ],
-    {
+      ...(state.messages as BaseMessage[]),
+    ];
+
+  const visionContextMessage =
+    ENABLE_VISION_SCREENSHOT_CONTEXT && settings.provider === "openai"
+      ? buildVisionContextMessageFromLastTool(state.messages as BaseMessage[])
+      : null;
+  const invokeMessages = visionContextMessage
+    ? [...baseModelMessages, visionContextMessage]
+    : baseModelMessages;
+
+  let response;
+  try {
+    response = await model.invoke(invokeMessages, {
       signal: fallbackAbortSignal,
+    });
+  } catch (error) {
+    if (!visionContextMessage) {
+      throw error;
     }
-  );
+    response = await model.invoke(baseModelMessages, {
+      signal: fallbackAbortSignal,
+    });
+  }
 
   const responseWithTools = response as unknown as {
     content: unknown;
