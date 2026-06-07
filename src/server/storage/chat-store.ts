@@ -4,20 +4,38 @@ import type {
   AgentRunRecord,
   ChatMessage,
   ChatSession,
+  BrowserToolName,
+  ExtensionConnection,
+  PendingToolRequest,
   RunStatus,
   SessionDetail,
   SessionStatus,
   SessionSummary,
+  ToolCallRecord,
+  ToolCallStatus,
+  ToolResultPayload,
 } from "@/types/chat"
 
 type StoredSession = ChatSession & {
   sdkSession: Session
+  extension?: ExtensionConnection
 }
 
 type ChatStoreState = {
   sessions: Map<string, StoredSession>
   messages: Map<string, ChatMessage[]>
   runs: Map<string, AgentRunRecord[]>
+  toolCalls: Map<string, ToolCallRecord[]>
+  pendingToolRequests: Map<string, PendingToolRequest[]>
+  toolResultWaiters: Map<
+    string,
+    {
+      resolve: (result: ToolResultPayload) => void
+      reject: (error: Error) => void
+      timeout: ReturnType<typeof setTimeout>
+    }
+  >
+  toolRequestWaiters: Map<string, Array<(request: PendingToolRequest | null) => void>>
 }
 
 const globalForChatStore = globalThis as typeof globalThis & {
@@ -30,8 +48,17 @@ function getState() {
       sessions: new Map(),
       messages: new Map(),
       runs: new Map(),
+      toolCalls: new Map(),
+      pendingToolRequests: new Map(),
+      toolResultWaiters: new Map(),
+      toolRequestWaiters: new Map(),
     }
   }
+
+  globalForChatStore.__browserAgentChatStore.toolCalls ??= new Map()
+  globalForChatStore.__browserAgentChatStore.pendingToolRequests ??= new Map()
+  globalForChatStore.__browserAgentChatStore.toolResultWaiters ??= new Map()
+  globalForChatStore.__browserAgentChatStore.toolRequestWaiters ??= new Map()
 
   return globalForChatStore.__browserAgentChatStore
 }
@@ -52,6 +79,8 @@ function toDetail(session: StoredSession): SessionDetail {
     ...publicSession,
     messages: state.messages.get(session.id) ?? [],
     runs: state.runs.get(session.id) ?? [],
+    toolCalls: state.toolCalls.get(session.id) ?? [],
+    extension: session.extension,
   }
 }
 
@@ -86,6 +115,8 @@ export const chatStore = {
     state.sessions.set(session.id, session)
     state.messages.set(session.id, [])
     state.runs.set(session.id, [])
+    state.toolCalls.set(session.id, [])
+    state.pendingToolRequests.set(session.id, [])
 
     return toDetail(session)
   },
@@ -118,10 +149,12 @@ export const chatStore = {
     return Array.from(state.sessions.values())
       .map((session) => {
         const runs = state.runs.get(session.id) ?? []
+        const toolCalls = state.toolCalls.get(session.id) ?? []
         return {
           ...withoutSdkSession(session),
           messageCount: state.messages.get(session.id)?.length ?? 0,
           lastRun: runs.at(-1),
+          toolCallCount: toolCalls.length,
         }
       })
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
@@ -238,5 +271,193 @@ export const chatStore = {
     })
 
     return run
+  },
+
+  connectExtension(sessionId: string, windowId: number) {
+    const timestamp = now()
+    const session = getState().sessions.get(sessionId)
+    if (!session) {
+      return null
+    }
+
+    session.extension = {
+      windowId,
+      connectedAt: session.extension?.connectedAt ?? timestamp,
+      lastSeenAt: timestamp,
+    }
+    session.updatedAt = timestamp
+
+    return toDetail(session)
+  },
+
+  touchExtension(sessionId: string) {
+    const session = getState().sessions.get(sessionId)
+    if (!session?.extension) {
+      return null
+    }
+
+    session.extension.lastSeenAt = now()
+    return session.extension
+  },
+
+  listToolCalls(sessionId: string) {
+    return getState().toolCalls.get(sessionId) ?? []
+  },
+
+  createToolRequest(input: {
+    sessionId: string
+    runId: string
+    name: BrowserToolName
+    args: unknown
+  }) {
+    const state = getState()
+    const timestamp = now()
+    const request: PendingToolRequest = {
+      id: createId("tool"),
+      sessionId: input.sessionId,
+      runId: input.runId,
+      name: input.name,
+      input: input.args,
+      createdAt: timestamp,
+    }
+    const record: ToolCallRecord = {
+      ...request,
+      status: "queued",
+    }
+
+    const toolCalls = state.toolCalls.get(input.sessionId) ?? []
+    toolCalls.push(record)
+    state.toolCalls.set(input.sessionId, toolCalls)
+
+    const pending = state.pendingToolRequests.get(input.sessionId) ?? []
+    pending.push(request)
+    state.pendingToolRequests.set(input.sessionId, pending)
+
+    this.updateSession(input.sessionId, {
+      updatedAt: timestamp,
+    })
+
+    const waiters = state.toolRequestWaiters.get(input.sessionId) ?? []
+    const nextWaiter = waiters.shift()
+    if (nextWaiter) {
+      state.toolRequestWaiters.set(input.sessionId, waiters)
+      const nextRequest = pending.shift() ?? request
+      state.pendingToolRequests.set(input.sessionId, pending)
+      nextWaiter(nextRequest)
+      this.updateToolCall(input.sessionId, request.id, {
+        status: "running",
+        startedAt: now(),
+      })
+    }
+
+    return request
+  },
+
+  async waitForToolRequest(sessionId: string, timeoutMs = 25000) {
+    const state = getState()
+    this.touchExtension(sessionId)
+
+    const pending = state.pendingToolRequests.get(sessionId) ?? []
+    const request = pending.shift()
+    if (request) {
+      state.pendingToolRequests.set(sessionId, pending)
+      this.updateToolCall(sessionId, request.id, {
+        status: "running",
+        startedAt: now(),
+      })
+      return request
+    }
+
+    return new Promise<PendingToolRequest | null>((resolve) => {
+      const waiter = (nextRequest: PendingToolRequest | null) => {
+        clearTimeout(timeout)
+        resolve(nextRequest)
+      }
+
+      const timeout = setTimeout(() => {
+        const waiters = state.toolRequestWaiters.get(sessionId) ?? []
+        state.toolRequestWaiters.set(
+          sessionId,
+          waiters.filter((w) => w !== waiter),
+        )
+        resolve(null)
+      }, timeoutMs)
+
+      const waiters = state.toolRequestWaiters.get(sessionId) ?? []
+      waiters.push(waiter)
+      state.toolRequestWaiters.set(sessionId, waiters)
+    })
+  },
+
+  waitForToolResult(toolCallId: string, timeoutMs = 60000) {
+    const state = getState()
+
+    return new Promise<ToolResultPayload>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        state.toolResultWaiters.delete(toolCallId)
+        reject(new Error(`Tool request ${toolCallId} timed out waiting for the extension.`))
+      }, timeoutMs)
+
+      state.toolResultWaiters.set(toolCallId, {
+        resolve,
+        reject,
+        timeout,
+      })
+    })
+  },
+
+  completeToolRequest(
+    sessionId: string,
+    toolCallId: string,
+    result: ToolResultPayload,
+  ) {
+    const state = getState()
+    const waiter = state.toolResultWaiters.get(toolCallId)
+    if (waiter) {
+      clearTimeout(waiter.timeout)
+      state.toolResultWaiters.delete(toolCallId)
+      waiter.resolve(result)
+    }
+
+    this.updateToolCall(sessionId, toolCallId, {
+      status: result.ok ? "completed" : "failed",
+      completedAt: now(),
+      output: result.output,
+      error: result.error,
+    })
+    this.touchExtension(sessionId)
+  },
+
+  updateToolCall(
+    sessionId: string,
+    toolCallId: string,
+    updates: Partial<
+      Pick<
+        ToolCallRecord,
+        "status" | "startedAt" | "completedAt" | "output" | "error"
+      >
+    >,
+  ) {
+    const toolCalls = getState().toolCalls.get(sessionId)
+    const toolCall = toolCalls?.find((item) => item.id === toolCallId)
+    if (!toolCall) {
+      return null
+    }
+
+    Object.assign(toolCall, updates)
+    return toolCall
+  },
+
+  setToolCallStatus(
+    sessionId: string,
+    toolCallId: string,
+    status: ToolCallStatus,
+    error?: string,
+  ) {
+    return this.updateToolCall(sessionId, toolCallId, {
+      status,
+      error,
+      completedAt: status === "completed" || status === "failed" ? now() : undefined,
+    })
   },
 }

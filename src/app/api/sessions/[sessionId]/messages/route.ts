@@ -1,7 +1,11 @@
 import { run } from "@openai/agents"
 import { z } from "zod"
 
-import { browserAgent, BROWSER_AGENT_NAME, DEFAULT_AGENT_MODEL } from "@/server/agents/browser-agent"
+import {
+  BROWSER_AGENT_NAME,
+  DEFAULT_AGENT_MODEL,
+  createBrowserAgent,
+} from "@/server/agents/browser-agent"
 import { optionsResponse, withCors } from "@/server/http/cors"
 import { chatStore } from "@/server/storage/chat-store"
 
@@ -27,6 +31,10 @@ function streamError(message: string, status = 500) {
       "Content-Type": "text/plain; charset=utf-8",
     }),
   })
+}
+
+function encodeStreamEvent(type: string, payload: Record<string, unknown>) {
+  return `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`
 }
 
 export async function POST(request: Request, context: RouteContext) {
@@ -61,11 +69,27 @@ export async function POST(request: Request, context: RouteContext) {
     async start(controller) {
       let assistantText = ""
 
+      function sendEvent(type: string, payload: Record<string, unknown>) {
+        controller.enqueue(encoder.encode(encodeStreamEvent(type, payload)))
+      }
+
       try {
-        const agentStream = await run(browserAgent, userMessage, {
+        const agent = createBrowserAgent({
+          sessionId,
+          runId: runRecord.id,
+          emitToolStatus: (event) => {
+            sendEvent("tool_status", event)
+          },
+        })
+
+        const agentStream = await run(agent, userMessage, {
           stream: true,
           session: sdkSession,
-          maxTurns: 4,
+          maxTurns: 12,
+          toolExecution: {
+            maxFunctionToolConcurrency: 1,
+          },
+          toolNotFoundBehavior: "return_error_to_model",
         })
 
         for await (const event of agentStream) {
@@ -74,7 +98,23 @@ export async function POST(request: Request, context: RouteContext) {
             event.data.type === "output_text_delta"
           ) {
             assistantText += event.data.delta
-            controller.enqueue(encoder.encode(event.data.delta))
+            sendEvent("text_delta", { delta: event.data.delta })
+          }
+
+          if (event.type === "run_item_stream_event") {
+            if (event.name === "tool_called") {
+              sendEvent("tool_status", {
+                status: "running",
+                message: "Tool call started",
+              })
+            }
+
+            if (event.name === "tool_output") {
+              sendEvent("tool_status", {
+                status: "completed",
+                message: "Tool output received",
+              })
+            }
           }
         }
 
@@ -96,8 +136,9 @@ export async function POST(request: Request, context: RouteContext) {
           error instanceof Error ? error.message : "Agent run failed unexpectedly."
 
         chatStore.completeRun(sessionId, runRecord.id, "failed", message)
-        controller.enqueue(encoder.encode(`\n\n[Error] ${message}`))
+        sendEvent("error", { message })
       } finally {
+        sendEvent("done", {})
         controller.close()
       }
     },
@@ -106,7 +147,7 @@ export async function POST(request: Request, context: RouteContext) {
   return new Response(stream, {
     headers: withCors({
       "Cache-Control": "no-cache, no-transform",
-      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Type": "text/event-stream; charset=utf-8",
       "X-Accel-Buffering": "no",
       "X-Session-Id": sessionId,
     }),

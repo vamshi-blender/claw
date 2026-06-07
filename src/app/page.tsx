@@ -80,6 +80,9 @@ export default async function Page({ searchParams }: PageProps) {
                           ? ` - run ${session.lastRun.status}`
                           : ""}
                       </span>
+                      <span className="text-xs font-normal text-muted-foreground">
+                        {session.toolCallCount} tool calls
+                      </span>
                     </span>
                   </a>
                 </Button>
@@ -99,6 +102,16 @@ export default async function Page({ searchParams }: PageProps) {
                 <CardAction>
                   <Badge variant="outline">{selectedSession.status}</Badge>
                 </CardAction>
+                {selectedSession.extension ? (
+                  <p className="text-xs text-muted-foreground">
+                    Extension window {selectedSession.extension.windowId} - last seen{" "}
+                    {formatDate(selectedSession.extension.lastSeenAt)}
+                  </p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Extension not connected.
+                  </p>
+                )}
                 {selectedSession.error ? (
                   <>
                     <Separator className="my-2" />
@@ -130,10 +143,42 @@ export default async function Page({ searchParams }: PageProps) {
               </CardContent>
 
               <CardFooter className="text-xs text-muted-foreground">
-                Runs: {selectedSession.runs.length}
-                {selectedSession.runs.at(-1)
-                  ? ` - latest ${selectedSession.runs.at(-1)?.status}`
-                  : ""}
+                <div className="grid w-full gap-3">
+                  <div>
+                    Runs: {selectedSession.runs.length}
+                    {selectedSession.runs.at(-1)
+                      ? ` - latest ${selectedSession.runs.at(-1)?.status}`
+                      : ""}
+                  </div>
+
+                  {selectedSession.toolCalls.length > 0 ? (
+                    <div className="grid gap-2">
+                      <Separator />
+                      <p className="font-medium text-foreground">Tool activity</p>
+                      <div className="grid gap-2">
+                        {selectedSession.toolCalls.slice(-8).map((toolCall) => (
+                          <div
+                            key={toolCall.id}
+                            className="grid gap-1 rounded-md border p-2"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-medium text-foreground">
+                                {toolCall.name}
+                              </span>
+                              <Badge variant="outline">{toolCall.status}</Badge>
+                            </div>
+                            <span>{formatDate(toolCall.completedAt ?? toolCall.startedAt ?? toolCall.createdAt)}</span>
+                            {toolCall.error ? (
+                              <span className="text-destructive">
+                                {toolCall.error}
+                              </span>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
               </CardFooter>
             </div>
           ) : (
