@@ -1,41 +1,71 @@
-# Browser Agent Foundation
+# Browser Agent
 
-Single-package project foundation for a browser-agent app with:
+Single-package browser-agent app with:
 
 - Next.js App Router frontend in `src/app`
 - Next.js API/backend routes in `src/app/api`
-- future server logic folders in `src/server`
-- Chrome extension source in `extension`
+- OpenAI Agents SDK server logic in `src/server`
+- Chrome extension side panel source in `extension`
 
-This foundation intentionally does not implement the OpenAI SDK agent, tool
-calling loop, database, authentication, real browser tools, or production admin
-monitoring features yet.
+This step implements a stateful streaming chatbot with one OpenAI Agent and no
+tools. Browser automation tools, authentication, durable production storage, and
+multi-agent routing are intentionally not implemented yet.
 
 ## Commands
 
 ```bash
 pnpm dev
+pnpm start
 pnpm build
 pnpm build:extension
+pnpm dev:extension
 pnpm lint
 pnpm typecheck
 ```
 
-## Backend Health Check
+## Environment
 
-The minimal backend connectivity route is available at:
+Create `.env.local` from `.env.example`:
+
+```bash
+OPENAI_API_KEY=sk-your-openai-api-key
+OPENAI_AGENT_MODEL=gpt-5.5
+```
+
+The OpenAI API key is used only by Next.js backend routes. Do not put it in the
+Chrome extension.
+
+## Backend Routes
 
 - `GET /api/health`
+- `GET /api/sessions`
+- `POST /api/sessions`
+- `GET /api/sessions/:sessionId`
+- `POST /api/sessions/:sessionId/messages`
 
-It returns:
+`POST /api/sessions/:sessionId/messages` streams plain text chunks as the agent
+generates the assistant response.
 
-```json
-{ "ok": true, "service": "backend" }
-```
+## Admin
+
+The root route `/` is the basic admin monitor. It lists recent sessions, status,
+last activity, conversation messages, and latest run state.
 
 ## Chrome Extension
 
 Extension source lives in `extension/src` and static manifest assets live in
-`extension/public`.
+`extension/public`. The extension uses Manifest V3 and Chrome Side Panel API.
 
-Build output is written to `extension/dist`.
+Build output is written to `extension/dist`. Load that folder in Chrome
+Developer Mode.
+
+The extension options page stores the backend URL in Chrome storage. The side
+panel uses that URL to create/resume a chat session and stream assistant
+responses from the backend.
+
+## Storage
+
+The current session store uses the Agents SDK `MemorySession` and an in-process
+development store for session, message, and run records. Replace
+`src/server/storage/chat-store.ts` with durable Vercel-compatible storage before
+production use.

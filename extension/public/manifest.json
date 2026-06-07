@@ -4,12 +4,16 @@
   "description": "Configures the backend URL for the browser-agent app foundation.",
   "version": "0.0.1",
   "action": {
-    "default_popup": "popup.html"
+    "default_title": "Open Browser Agent"
+  },
+  "options_page": "popup.html",
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "background": {
     "service_worker": "assets/background.js",
     "type": "module"
   },
-  "permissions": ["storage"],
+  "permissions": ["storage", "sidePanel"],
   "host_permissions": ["http://*/*", "https://*/*"]
 }
