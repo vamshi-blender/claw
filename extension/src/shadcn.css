@@ -1,0 +1,10 @@
+@import "../../src/app/globals.css";
+
+@source ".";
+@source "../../src/components";
+
+html,
+body,
+#root {
+  min-height: 100%;
+}

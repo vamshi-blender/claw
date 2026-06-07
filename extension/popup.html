@@ -3,33 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Browser Agent Connector</title>
+    <title>Browser Agent</title>
   </head>
   <body>
-    <main>
-      <div>
-        <h1>Backend connection</h1>
-        <p>Set the Next.js backend this extension should connect to.</p>
-      </div>
-
-      <form id="backend-form">
-        <label for="backend-url">Backend URL</label>
-        <input
-          id="backend-url"
-          name="backendUrl"
-          placeholder="http://localhost:3000"
-          autocomplete="off"
-        />
-        <div class="actions">
-          <button type="submit">Save</button>
-          <button id="test-connection" class="secondary" type="button">
-            Test connection
-          </button>
-        </div>
-      </form>
-
-      <p id="status" role="status" aria-live="polite"></p>
-    </main>
-    <script type="module" src="/src/popup.ts"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/popup.tsx"></script>
   </body>
 </html>

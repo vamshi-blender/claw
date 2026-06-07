@@ -1,4 +1,15 @@
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
+import { Separator } from "@/components/ui/separator"
 import { chatStore } from "@/server/storage/chat-store"
 
 type PageProps = {
@@ -39,99 +50,98 @@ export default async function Page({ searchParams }: PageProps) {
             </h1>
           </div>
 
-          <div className="divide-y rounded-md border">
+          <Card size="sm" className="gap-0 py-0">
             {sessions.length === 0 ? (
-              <div className="p-4 text-sm text-muted-foreground">
+              <CardContent className="p-4 text-sm text-muted-foreground">
                 No sessions yet. Start a chat from the Chrome side panel.
-              </div>
+              </CardContent>
             ) : (
               sessions.map((session) => (
-                <a
+                <Button
                   key={session.id}
-                  href={`/?session=${session.id}`}
-                  className="block p-4 text-sm hover:bg-muted/60"
+                  asChild
+                  variant="ghost"
+                  className="h-auto justify-start rounded-none px-4 py-3 first:rounded-t-xl last:rounded-b-xl"
                 >
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="truncate font-medium">{session.title}</span>
-                    <span className="rounded-md border px-2 py-0.5 text-xs text-muted-foreground">
-                      {session.status}
+                  <a href={`/?session=${session.id}`}>
+                    <span className="grid min-w-0 flex-1 gap-1 text-left">
+                      <span className="flex items-center justify-between gap-3">
+                        <span className="truncate font-medium">
+                          {session.title}
+                        </span>
+                        <Badge variant="outline">{session.status}</Badge>
+                      </span>
+                      <span className="text-xs font-normal text-muted-foreground">
+                        {formatDate(session.lastMessageAt ?? session.updatedAt)}
+                      </span>
+                      <span className="text-xs font-normal text-muted-foreground">
+                        {session.messageCount} messages
+                        {session.lastRun
+                          ? ` - run ${session.lastRun.status}`
+                          : ""}
+                      </span>
                     </span>
-                  </div>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {formatDate(session.lastMessageAt ?? session.updatedAt)}
-                  </p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {session.messageCount} messages
-                    {session.lastRun ? ` - run ${session.lastRun.status}` : ""}
-                  </p>
-                </a>
+                  </a>
+                </Button>
               ))
             )}
-          </div>
+          </Card>
         </section>
 
-        <section className="min-h-[640px] rounded-md border">
+        <Card className="min-h-[640px] gap-0 py-0">
           {selectedSession ? (
             <div className="flex h-full flex-col">
-              <header className="border-b p-4">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <h2 className="text-xl font-semibold tracking-normal">
-                      {selectedSession.title}
-                    </h2>
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      {selectedSession.id}
-                    </p>
-                  </div>
-                  <Button variant="outline" size="sm">
-                    {selectedSession.status}
-                  </Button>
-                </div>
+              <CardHeader className="border-b p-4">
+                <CardTitle className="text-xl">
+                  {selectedSession.title}
+                </CardTitle>
+                <CardDescription>{selectedSession.id}</CardDescription>
+                <CardAction>
+                  <Badge variant="outline">{selectedSession.status}</Badge>
+                </CardAction>
                 {selectedSession.error ? (
-                  <p className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
-                    {selectedSession.error}
-                  </p>
+                  <>
+                    <Separator className="my-2" />
+                    <Badge variant="destructive" className="h-auto py-1">
+                      {selectedSession.error}
+                    </Badge>
+                  </>
                 ) : null}
-              </header>
+              </CardHeader>
 
-              <div className="flex-1 space-y-4 overflow-auto p-4">
+              <CardContent className="flex-1 space-y-4 overflow-auto p-4">
                 {selectedSession.messages.length === 0 ? (
                   <p className="text-sm text-muted-foreground">
                     This session has no messages yet.
                   </p>
                 ) : (
                   selectedSession.messages.map((message) => (
-                    <article
-                      key={message.id}
-                      className="rounded-md border p-3 text-sm"
-                    >
-                      <div className="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
-                        <span className="font-medium uppercase">
-                          {message.role}
-                        </span>
+                    <Card key={message.id} size="sm" className="gap-2 p-3">
+                      <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                        <Badge variant="outline">{message.role}</Badge>
                         <time>{formatDate(message.createdAt)}</time>
                       </div>
                       <p className="whitespace-pre-wrap leading-6">
                         {message.content}
                       </p>
-                    </article>
+                    </Card>
                   ))
                 )}
-              </div>
+              </CardContent>
 
-              <footer className="border-t p-4 text-xs text-muted-foreground">
+              <CardFooter className="text-xs text-muted-foreground">
                 Runs: {selectedSession.runs.length}
                 {selectedSession.runs.at(-1)
                   ? ` - latest ${selectedSession.runs.at(-1)?.status}`
                   : ""}
-              </footer>
+              </CardFooter>
             </div>
           ) : (
             <div className="flex h-full min-h-[640px] items-center justify-center p-6 text-sm text-muted-foreground">
               Select a session to inspect conversation history and run status.
             </div>
           )}
-        </section>
+        </Card>
       </div>
     </main>
   )

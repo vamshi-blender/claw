@@ -1,6 +1,21 @@
 import React from "react"
 import { createRoot } from "react-dom/client"
+import { Plus } from "lucide-react"
 
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import {
+  AlertDialog,
+  AlertDialogContent,
+  // AlertDialogDescription,
+  AlertDialogHeader,
+  AlertDialogMedia,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import { Button } from "@/components/ui/button"
+import { Spinner } from "@/components/ui/spinner"
+import { Textarea } from "@/components/ui/textarea"
+
+import { ExtensionThemeProvider } from "./extension-theme-provider"
 import "./sidepanel.css"
 
 type ChatRole = "user" | "assistant"
@@ -56,6 +71,7 @@ function App() {
   const [sessionId, setSessionId] = React.useState<string>()
   const [messages, setMessages] = React.useState<ChatMessage[]>([])
   const [input, setInput] = React.useState("")
+  const [isInitializing, setIsInitializing] = React.useState(true)
   const [isStreaming, setIsStreaming] = React.useState(false)
   const [error, setError] = React.useState<string>()
   const messageListRef = React.useRef<HTMLDivElement>(null)
@@ -102,6 +118,8 @@ function App() {
             ? bootstrapError.message
             : "Unable to initialize chat.",
         )
+      } finally {
+        setIsInitializing(false)
       }
     }
 
@@ -194,39 +212,79 @@ function App() {
   }
 
   return (
-    <main className="sidepanel">
-      <header className="topbar">
-        <div>
-          <h1>Browser Agent</h1>
-          <p>{backendUrl}</p>
+    <main className="flex h-screen flex-col bg-background text-foreground">
+      <AlertDialog open={isInitializing}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogMedia>
+              <Spinner className="size-5" />
+            </AlertDialogMedia>
+            <AlertDialogTitle>Connecting to the backend</AlertDialogTitle>
+            {/* <AlertDialogDescription>
+              Preparing your browser agent session. The chat composer will unlock
+              as soon as the saved backend URL responds.
+            </AlertDialogDescription> */}
+          </AlertDialogHeader>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <header className="flex items-center justify-between gap-3 border-b bg-card p-3">
+        <div className="min-w-0">
+          <h1 className="text-base font-semibold tracking-normal">Browser Agent</h1>
+          <p className="truncate text-xs text-muted-foreground">{backendUrl}</p>
         </div>
-        <button
-          className="icon-button"
+        <Button
+          variant="outline"
+          size="icon"
           type="button"
           title="Start new session"
           onClick={() => void createSession()}
           disabled={isStreaming}
         >
-          +
-        </button>
+          <Plus />
+        </Button>
       </header>
 
-      {error ? <div className="error">{error}</div> : null}
+      {error ? (
+        <Alert variant="destructive" className="m-3 mb-0">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      ) : null}
 
-      <div ref={messageListRef} className="messages">
+      <div
+        ref={messageListRef}
+        className="min-h-0 flex-1 overflow-y-auto p-3"
+      >
         {messages.length === 0 ? (
-          <div className="empty">
-            <h2>Ask the backend agent</h2>
-            <p>This chat streams responses from the saved backend URL.</p>
+          <div className="flex min-h-full flex-col justify-center gap-1 text-center">
+            <h2 className="text-base font-semibold tracking-normal">
+              Ask the backend agent
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              This chat streams responses from the saved backend URL.
+            </p>
           </div>
         ) : (
           messages.map((message) => (
-            <article key={message.id} className={`message ${message.role}`}>
-              <div className="bubble">
+            <article
+              key={message.id}
+              className={
+                message.role === "user"
+                  ? "my-2 flex justify-end"
+                  : "my-2 flex justify-start"
+              }
+            >
+              <div
+                className={
+                  message.role === "user"
+                    ? "max-w-[86%] whitespace-pre-wrap rounded-lg bg-primary px-3 py-2 text-sm leading-6 text-primary-foreground"
+                    : "max-w-[86%] whitespace-pre-wrap rounded-lg border bg-card px-3 py-2 text-sm leading-6"
+                }
+              >
                 {message.content ? (
                   message.content
                 ) : (
-                  <span className="streaming">Thinking...</span>
+                  <span className="text-muted-foreground">Thinking...</span>
                 )}
               </div>
             </article>
@@ -234,20 +292,32 @@ function App() {
         )}
       </div>
 
-      <form className="composer" onSubmit={sendMessage}>
-        <textarea
+      <form
+        className="grid h-[92px] flex-none grid-cols-[1fr_auto] gap-2 border-t bg-card p-3"
+        onSubmit={sendMessage}
+      >
+        <Textarea
+          className="h-[68px] min-h-0 resize-none"
           value={input}
           onChange={(event) => setInput(event.target.value)}
           placeholder="Message the agent"
           rows={3}
           disabled={isStreaming || !sessionId}
         />
-        <button type="submit" disabled={isStreaming || !input.trim() || !sessionId}>
+        <Button
+          className="self-end"
+          type="submit"
+          disabled={isStreaming || !input.trim() || !sessionId}
+        >
           {isStreaming ? "Sending" : "Send"}
-        </button>
+        </Button>
       </form>
     </main>
   )
 }
 
-createRoot(document.querySelector("#root")!).render(<App />)
+createRoot(document.querySelector("#root")!).render(
+  <ExtensionThemeProvider>
+    <App />
+  </ExtensionThemeProvider>,
+)

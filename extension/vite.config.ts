@@ -5,6 +5,11 @@ import { defineConfig } from "vite"
 export default defineConfig({
   root: resolve(__dirname),
   publicDir: "public",
+  resolve: {
+    alias: {
+      "@": resolve(__dirname, "../src"),
+    },
+  },
   build: {
     emptyOutDir: true,
     outDir: "dist",

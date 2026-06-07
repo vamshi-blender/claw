@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Browser Agent Connector",
+  "name": "Browser Agent",
   "description": "Configures the backend URL for the browser-agent app foundation.",
   "version": "0.0.1",
   "action": {
