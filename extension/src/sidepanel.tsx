@@ -1,6 +1,8 @@
 import React from "react"
 import { createRoot } from "react-dom/client"
 import { Check, Copy, Plus } from "lucide-react"
+import ReactMarkdown from "react-markdown"
+import remarkGfm from "remark-gfm"
 
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import {
@@ -499,6 +501,19 @@ function App() {
     }
   }
 
+  function handleComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (
+      event.key !== "Enter" ||
+      event.shiftKey ||
+      event.nativeEvent.isComposing
+    ) {
+      return
+    }
+
+    event.preventDefault()
+    event.currentTarget.form?.requestSubmit()
+  }
+
   return (
     <main className="flex h-screen flex-col bg-background text-foreground">
       <AlertDialog open={isInitializing}>
@@ -589,11 +604,59 @@ function App() {
                 className={
                   message.role === "user"
                     ? "max-w-[86%] whitespace-pre-wrap rounded-lg bg-primary px-3 py-2 text-sm leading-6 text-primary-foreground"
-                    : "max-w-[86%] whitespace-pre-wrap rounded-lg border bg-card px-3 py-2 text-sm leading-6"
+                    : "max-w-[86%] rounded-lg border bg-card px-3 py-2 text-sm leading-6"
                 }
               >
                 {message.content ? (
-                  message.content
+                  message.role === "user" ? (
+                    message.content
+                  ) : (
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
+                        strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                        em: ({ children }) => <em className="italic">{children}</em>,
+                        code: ({ children, className }) => {
+                          const isBlock = className?.includes("language-")
+                          return isBlock ? (
+                            <code className="block overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs">
+                              {children}
+                            </code>
+                          ) : (
+                            <code className="rounded bg-muted px-1 font-mono text-xs">{children}</code>
+                          )
+                        },
+                        pre: ({ children }) => <pre className="mb-2 overflow-x-auto rounded bg-muted p-2">{children}</pre>,
+                        ul: ({ children }) => <ul className="mb-2 list-disc pl-4">{children}</ul>,
+                        ol: ({ children }) => <ol className="mb-2 list-decimal pl-4">{children}</ol>,
+                        li: ({ children }) => <li className="mb-0.5">{children}</li>,
+                        h1: ({ children }) => <h1 className="mb-1 text-base font-bold">{children}</h1>,
+                        h2: ({ children }) => <h2 className="mb-1 text-sm font-bold">{children}</h2>,
+                        h3: ({ children }) => <h3 className="mb-1 text-sm font-semibold">{children}</h3>,
+                        a: ({ href, children }) => (
+                          <a href={href} target="_blank" rel="noreferrer" className="underline">
+                            {children}
+                          </a>
+                        ),
+                        blockquote: ({ children }) => (
+                          <blockquote className="mb-2 border-l-2 border-muted-foreground pl-2 text-muted-foreground">
+                            {children}
+                          </blockquote>
+                        ),
+                        hr: () => <hr className="my-2 border-border" />,
+                        table: ({ children }) => (
+                          <div className="mb-2 overflow-x-auto">
+                            <table className="w-full border-collapse text-xs">{children}</table>
+                          </div>
+                        ),
+                        th: ({ children }) => <th className="border border-border px-2 py-1 text-left font-semibold">{children}</th>,
+                        td: ({ children }) => <td className="border border-border px-2 py-1">{children}</td>,
+                      }}
+                    >
+                      {message.content}
+                    </ReactMarkdown>
+                  )
                 ) : (
                   <span className="text-muted-foreground">Thinking...</span>
                 )}
@@ -611,14 +674,16 @@ function App() {
           className="h-[68px] min-h-0 resize-none"
           value={input}
           onChange={(event) => setInput(event.target.value)}
+          onKeyDown={handleComposerKeyDown}
           placeholder="Message the agent"
           rows={3}
-          disabled={isStreaming || !sessionId}
+          disabled={isInitializing || isStreaming || !sessionId}
+          aria-label="Message the agent"
         />
         <Button
           className="self-end"
           type="submit"
-          disabled={isStreaming || !input.trim() || !sessionId}
+          disabled={isInitializing || isStreaming || !input.trim() || !sessionId}
         >
           {isStreaming ? "Sending" : "Send"}
         </Button>

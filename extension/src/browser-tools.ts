@@ -304,8 +304,8 @@ async function readPage(windowId: number, args: ToolArgs) {
     [
       {
         depth: asNumber(args.depth, 8),
-        filter: args.filter === "interactive" ? "interactive" : "all",
-        maxChars: asNumber(args.max_chars, 50000),
+        filter: args.filter === "all" ? "all" : "interactive",
+        maxChars: asNumber(args.max_chars, 20000),
         refId: asString(args.ref_id) || undefined,
       },
     ],

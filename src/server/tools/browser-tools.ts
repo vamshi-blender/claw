@@ -146,17 +146,20 @@ const toolDefinitions: ToolDefinition[] = [
   {
     name: "read_page",
     description:
-      "Read a structured summary of page elements and refs. Use refs with find, form_input, and computer actions.",
+      "Read a structured summary of page elements and refs. Defaults to interactive elements to keep browser-agent turns fast. Use refs with find, form_input, and computer actions.",
     parameters: z.object({
       tabId,
       depth: z.number().int().positive().optional().describe("Maximum DOM depth. Defaults to 8."),
-      filter: z.enum(["interactive", "all"]).optional().describe("Element filter."),
+      filter: z
+        .enum(["interactive", "all"])
+        .optional()
+        .describe("Element filter. Defaults to interactive."),
       max_chars: z
         .number()
         .int()
         .positive()
         .optional()
-        .describe("Maximum output characters. Defaults to 50000."),
+        .describe("Maximum output characters. Defaults to 20000."),
       ref_id: z.string().optional().describe("Optional parent ref to inspect."),
     }),
   },
