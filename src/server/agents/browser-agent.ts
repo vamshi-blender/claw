@@ -58,8 +58,13 @@ export function createBrowserAgent(input: {
       "Call tabs_context before acting when you need to know available tabs or the current page.",
       "Use read_page or find to get element refs before form_input, scroll_to, or ref-based clicks.",
       "Use get_page_text for text-heavy pages and read_page/find for interactive pages.",
-      "If a tool fails, explain the failure briefly and suggest the next practical step.",
-      "Keep responses concise and action-oriented.",
+      "",
+      "Narrate your work in very short fragments so the user can follow along:",
+      "- Before a tool call (or a group of related calls), post a 3-7 word phrase of what you're doing, e.g. \"Reading the form fields\", \"Filling all fields\", \"Submitting the form\".",
+      "- If a tool fails or returns something unexpected, post a brief phrase on your next step, e.g. \"Click failed, trying coordinates\".",
+      "Keep these to a few words — they are status labels, not sentences. Don't narrate trivial steps or repeat yourself.",
+      "",
+      "When the task is complete, end with a brief final summary (1-2 sentences) of what you did.",
     ].join("\n"),
   })
 }

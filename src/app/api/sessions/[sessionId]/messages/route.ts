@@ -41,6 +41,27 @@ function isAbortError(error: unknown) {
   return error instanceof Error && error.name === "AbortError"
 }
 
+function stringifyToolValue(value: unknown) {
+  if (typeof value === "string") {
+    return value
+  }
+
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value ?? "")
+  }
+}
+
+function looksLikeToolError(output: string) {
+  try {
+    const parsed = JSON.parse(output) as { ok?: unknown }
+    return parsed?.ok === false
+  } catch {
+    return false
+  }
+}
+
 export async function POST(request: Request, context: RouteContext) {
   if (!process.env.OPENAI_API_KEY) {
     return streamError("OPENAI_API_KEY is not configured.", 500)
@@ -123,17 +144,55 @@ export async function POST(request: Request, context: RouteContext) {
           }
 
           if (event.type === "run_item_stream_event") {
+            if (event.name === "reasoning_item_created") {
+              const raw = event.item.rawItem as {
+                content?: Array<{ text?: string }>
+              }
+              const text = (raw.content ?? [])
+                .map((entry) => entry.text ?? "")
+                .join("\n")
+                .trim()
+
+              if (text) {
+                sendEvent("reasoning", { text })
+              }
+            }
+
             if (event.name === "tool_called") {
+              const raw = event.item.rawItem as {
+                callId?: string
+                id?: string
+                name?: string
+                arguments?: string
+              }
+
+              sendEvent("tool_call", {
+                toolCallId: raw.callId ?? raw.id ?? "",
+                name: raw.name ?? "tool",
+                arguments: raw.arguments ?? "",
+              })
               sendEvent("tool_status", {
                 status: "running",
-                message: "Tool call started",
+                message: `Running ${raw.name ?? "tool"}`,
               })
             }
 
             if (event.name === "tool_output") {
+              const item = event.item as {
+                callId?: string
+                output?: unknown
+              }
+              const output = stringifyToolValue(item.output)
+              const isError = looksLikeToolError(output)
+
+              sendEvent("tool_result", {
+                toolCallId: item.callId ?? "",
+                output,
+                isError,
+              })
               sendEvent("tool_status", {
-                status: "completed",
-                message: "Tool output received",
+                status: isError ? "failed" : "completed",
+                message: isError ? "Tool failed" : "Tool output received",
               })
             }
           }

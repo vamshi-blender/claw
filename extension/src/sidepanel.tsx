@@ -28,11 +28,24 @@ import "./sidepanel.css"
 
 type ChatRole = "user" | "assistant"
 
-type ChatMessage = {
-  id: string
-  role: ChatRole
-  content: string
-}
+type ToolPartStatus = "running" | "completed" | "failed"
+
+type AssistantPart =
+  | { kind: "text"; text: string }
+  | { kind: "reasoning"; text: string }
+  | {
+      kind: "tool"
+      toolCallId: string
+      name: string
+      args?: string
+      status: ToolPartStatus
+      output?: string
+      isError?: boolean
+    }
+
+type ChatMessage =
+  | { id: string; role: "user"; content: string }
+  | { id: string; role: "assistant"; parts: AssistantPart[] }
 
 type SessionMessage = {
   id: string
@@ -50,6 +63,14 @@ type SessionDetail = {
 
 type StreamEvent =
   | { type: "text_delta"; delta: string }
+  | { type: "reasoning"; text: string }
+  | { type: "tool_call"; toolCallId: string; name: string; arguments: string }
+  | {
+      type: "tool_result"
+      toolCallId: string
+      output: string
+      isError: boolean
+    }
   | {
       type: "tool_status"
       name?: string
@@ -78,6 +99,20 @@ function isSessionChatMessage(
   message: SessionMessage,
 ): message is SessionMessage & { role: ChatRole } {
   return isChatMessageRole(message.role)
+}
+
+function sessionMessageToChatMessage(
+  message: SessionMessage & { role: ChatRole },
+): ChatMessage {
+  if (message.role === "user") {
+    return { id: message.id, role: "user", content: message.content }
+  }
+
+  return {
+    id: message.id,
+    role: "assistant",
+    parts: message.content ? [{ kind: "text", text: message.content }] : [],
+  }
 }
 
 async function getBackendUrl() {
@@ -262,6 +297,161 @@ function getMarkdownText(children: React.ReactNode) {
   return String(children ?? "")
 }
 
+function formatToolValue(value: string | undefined) {
+  if (!value) {
+    return ""
+  }
+
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2)
+  } catch {
+    return value
+  }
+}
+
+const markdownComponents: React.ComponentProps<typeof ReactMarkdown>["components"] = {
+  h1: ({ children }) => <h1 className="mb-2 text-base font-bold leading-tight break-words last:mb-0">{children}</h1>,
+  h2: ({ children }) => <h2 className="mb-2 text-sm font-semibold leading-tight break-words last:mb-0">{children}</h2>,
+  h3: ({ children }) => <h3 className="mb-1.5 text-[13px] font-semibold leading-snug break-words last:mb-0">{children}</h3>,
+  h4: ({ children }) => <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] break-words last:mb-0">{children}</h4>,
+  p: ({ children }) => <p className="mb-1 break-words last:mb-0">{children}</p>,
+  strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+  em: ({ children }) => <em className="italic">{children}</em>,
+  ul: ({ children }) => <ul className="mb-1 ml-4 list-disc space-y-1 last:mb-0">{children}</ul>,
+  ol: ({ children }) => <ol className="mb-1 ml-4 list-decimal space-y-1 last:mb-0">{children}</ol>,
+  li: ({ children }) => <li className="break-words marker:text-current">{children}</li>,
+  table: ({ children }) => (
+    <div className="mb-1 overflow-x-auto rounded-lg border border-current/10 last:mb-0">
+      <table className="min-w-full border-collapse text-left text-[11px] leading-relaxed">
+        {children}
+      </table>
+    </div>
+  ),
+  thead: ({ children }) => <thead className="bg-black/8">{children}</thead>,
+  tbody: ({ children }) => <tbody>{children}</tbody>,
+  tr: ({ children }) => <tr className="border-b border-current/10 last:border-b-0">{children}</tr>,
+  th: ({ children }) => <th className="px-2.5 py-1.5 font-semibold whitespace-nowrap">{children}</th>,
+  td: ({ children }) => <td className="px-2.5 py-1.5 align-top break-words">{children}</td>,
+  code: ({ children, className }) => {
+    const text = getMarkdownText(children)
+    const isBlock = Boolean(className) || text.includes("\n")
+    if (isBlock) {
+      return <code className="font-mono text-[11px] whitespace-pre-wrap break-words">{text.replace(/\n$/, "")}</code>
+    }
+    return <code className="rounded bg-black/10 px-1.5 py-0.5 font-mono text-[11px] break-all">{children}</code>
+  },
+  pre: ({ children }) => <pre className="mb-1 overflow-hidden rounded-lg bg-black/10 px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words last:mb-0">{children}</pre>,
+  blockquote: ({ children }) => <blockquote className="mb-1 border-l-2 border-current/50 pl-3 opacity-85 last:mb-0">{children}</blockquote>,
+  hr: () => <hr className="my-2 border-current/15" />,
+  a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer" className="break-all underline underline-offset-2 opacity-85 hover:opacity-100">{children}</a>,
+}
+
+function MessageMarkdown({ children }: { children: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+      {children}
+    </ReactMarkdown>
+  )
+}
+
+function ToolStatusDot({ status }: { status: ToolPartStatus }) {
+  const color =
+    status === "running"
+      ? "bg-amber-500"
+      : status === "failed"
+        ? "bg-destructive"
+        : "bg-emerald-500"
+  return <span className={`size-2 shrink-0 rounded-full ${color}`} aria-hidden />
+}
+
+function ToolCard({
+  part,
+}: {
+  part: Extract<AssistantPart, { kind: "tool" }>
+}) {
+  const statusLabel =
+    part.status === "running"
+      ? "Running"
+      : part.status === "failed" || part.isError
+        ? "Failed"
+        : "Done"
+  const formattedArgs = formatToolValue(part.args)
+  const formattedOutput = formatToolValue(part.output)
+
+  return (
+    <details className="w-[86%] max-w-[86%] rounded-lg border bg-card/60 text-xs">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2">
+        <ToolStatusDot status={part.status} />
+        <span className="font-mono font-medium">{part.name}</span>
+        {part.status === "running" ? <Spinner className="size-3" /> : null}
+        <span className="ml-auto text-[10px] uppercase tracking-wide text-muted-foreground">
+          {statusLabel}
+        </span>
+      </summary>
+      <div className="space-y-2 border-t px-3 py-2">
+        {formattedArgs ? (
+          <div>
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Input
+            </div>
+            <pre className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed">
+              {formattedArgs}
+            </pre>
+          </div>
+        ) : null}
+        {part.output !== undefined ? (
+          <div>
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              {part.isError ? "Error" : "Output"}
+            </div>
+            <pre className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed">
+              {formattedOutput}
+            </pre>
+          </div>
+        ) : part.status === "running" ? (
+          <div className="text-muted-foreground">Waiting for result…</div>
+        ) : null}
+      </div>
+    </details>
+  )
+}
+
+function AssistantPartView({ part }: { part: AssistantPart }) {
+  if (part.kind === "text") {
+    if (!part.text) {
+      return null
+    }
+    return (
+      <div className="max-w-[86%] rounded-lg border bg-card px-3 py-2 text-sm leading-6">
+        <MessageMarkdown>{part.text}</MessageMarkdown>
+      </div>
+    )
+  }
+
+  if (part.kind === "reasoning") {
+    return (
+      <div className="max-w-[86%] rounded-lg border border-dashed bg-muted/40 px-3 py-2 text-xs italic leading-5 text-muted-foreground">
+        {part.text}
+      </div>
+    )
+  }
+
+  return <ToolCard part={part} />
+}
+
+function ThinkingIndicator() {
+  return (
+    <div className="flex items-center gap-2 px-1 py-1 text-xs text-muted-foreground">
+      <span className="flex gap-1">
+        <span className="size-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.3s]" />
+        <span className="size-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.15s]" />
+        <span className="size-1.5 animate-bounce rounded-full bg-current" />
+      </span>
+      <span>Thinking…</span>
+    </div>
+  )
+}
+
 function App() {
   const [backendUrl, setBackendUrl] = React.useState(DEFAULT_BACKEND_URL)
   const [sessionId, setSessionId] = React.useState<string>()
@@ -270,6 +460,7 @@ function App() {
   const [input, setInput] = React.useState("")
   const [isInitializing, setIsInitializing] = React.useState(true)
   const [isStreaming, setIsStreaming] = React.useState(false)
+  const [isThinking, setIsThinking] = React.useState(false)
   const [isCopied, setIsCopied] = React.useState(false)
   const [error, setError] = React.useState<string>()
   const [toolStatus, setToolStatus] = React.useState<string>()
@@ -294,11 +485,7 @@ function App() {
             setMessages(
               data.session.messages
                 .filter(isSessionChatMessage)
-                .map((message) => ({
-                  id: message.id,
-                  role: message.role,
-                  content: message.content,
-                })),
+                .map(sessionMessageToChatMessage),
             )
             return
           }
@@ -445,11 +632,25 @@ function App() {
     setInput("")
     setError(undefined)
     setIsStreaming(true)
+    setIsThinking(true)
+    let runningTools = 0
     setMessages((current) => [
       ...current,
       { id: createLocalId("user"), role: "user", content },
-      { id: assistantId, role: "assistant", content: "" },
+      { id: assistantId, role: "assistant", parts: [] },
     ])
+
+    function updateAssistantParts(
+      updater: (parts: AssistantPart[]) => AssistantPart[],
+    ) {
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === assistantId && message.role === "assistant"
+            ? { ...message, parts: updater(message.parts) }
+            : message,
+        ),
+      )
+    }
 
     try {
       const response = await fetch(`${backendUrl}/api/sessions/${sessionId}/messages`, {
@@ -482,11 +683,53 @@ function App() {
 
         for (const event of parsed.events) {
           if (event.type === "text_delta") {
-            setMessages((current) =>
-              current.map((message) =>
-                message.id === assistantId
-                  ? { ...message, content: message.content + event.delta }
-                  : message,
+            setIsThinking(false)
+            const delta = event.delta
+            updateAssistantParts((parts) => {
+              const last = parts[parts.length - 1]
+              if (last?.kind === "text") {
+                return [
+                  ...parts.slice(0, -1),
+                  { ...last, text: last.text + delta },
+                ]
+              }
+              return [...parts, { kind: "text", text: delta }]
+            })
+          }
+
+          if (event.type === "reasoning") {
+            setIsThinking(false)
+            const text = event.text
+            updateAssistantParts((parts) => [...parts, { kind: "reasoning", text }])
+          }
+
+          if (event.type === "tool_call") {
+            setIsThinking(false)
+            runningTools += 1
+            const { toolCallId, name, arguments: args } = event
+            updateAssistantParts((parts) => [
+              ...parts,
+              { kind: "tool", toolCallId, name, args, status: "running" },
+            ])
+          }
+
+          if (event.type === "tool_result") {
+            runningTools = Math.max(0, runningTools - 1)
+            // The model is reasoning about its next step once every tool settles.
+            if (runningTools === 0) {
+              setIsThinking(true)
+            }
+            const { toolCallId, output, isError } = event
+            updateAssistantParts((parts) =>
+              parts.map((part) =>
+                part.kind === "tool" && part.toolCallId === toolCallId
+                  ? {
+                      ...part,
+                      status: isError ? "failed" : "completed",
+                      output,
+                      isError,
+                    }
+                  : part,
               ),
             )
           }
@@ -502,12 +745,8 @@ function App() {
       }
     } catch (sendError) {
       if (abortController.signal.aborted) {
-        setMessages((current) =>
-          current.map((item) =>
-            item.id === assistantId && !item.content
-              ? { ...item, content: "Stopped." }
-              : item,
-          ),
+        updateAssistantParts((parts) =>
+          parts.length === 0 ? [{ kind: "text", text: "Stopped." }] : parts,
         )
         return
       }
@@ -515,18 +754,17 @@ function App() {
       const message =
         sendError instanceof Error ? sendError.message : "Unable to send message."
       setError(message)
-      setMessages((current) =>
-        current.map((item) =>
-          item.id === assistantId && !item.content
-            ? { ...item, content: `Error: ${message}` }
-            : item,
-        ),
+      updateAssistantParts((parts) =>
+        parts.length === 0
+          ? [{ kind: "text", text: `Error: ${message}` }]
+          : parts,
       )
     } finally {
       if (messageAbortControllerRef.current === abortController) {
         messageAbortControllerRef.current = null
       }
       setIsStreaming(false)
+      setIsThinking(false)
       setToolStatus(undefined)
     }
   }
@@ -621,70 +859,29 @@ function App() {
             </p>
           </div>
         ) : (
-          messages.map((message) => (
-            <article
-              key={message.id}
-              className={
-                message.role === "user"
-                  ? "my-2 flex justify-end"
-                  : "my-2 flex justify-start"
-              }
-            >
-              <div
-                className={
-                  message.role === "user"
-                    ? "max-w-[86%] rounded-lg bg-primary px-3 py-2 text-sm leading-6 text-primary-foreground"
-                    : "max-w-[86%] rounded-lg border bg-card px-3 py-2 text-sm leading-6"
-                }
+          messages.map((message, messageIndex) =>
+            message.role === "user" ? (
+              <article key={message.id} className="my-2 flex justify-end">
+                <div className="max-w-[86%] rounded-lg bg-primary px-3 py-2 text-sm leading-6 text-primary-foreground">
+                  <MessageMarkdown>{message.content}</MessageMarkdown>
+                </div>
+              </article>
+            ) : (
+              <article
+                key={message.id}
+                className="my-2 flex flex-col items-start gap-1.5"
               >
-                {message.content ? (
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm]}
-                    components={{
-                      h1: ({ children }) => <h1 className="mb-2 text-base font-bold leading-tight break-words last:mb-0">{children}</h1>,
-                      h2: ({ children }) => <h2 className="mb-2 text-sm font-semibold leading-tight break-words last:mb-0">{children}</h2>,
-                      h3: ({ children }) => <h3 className="mb-1.5 text-[13px] font-semibold leading-snug break-words last:mb-0">{children}</h3>,
-                      h4: ({ children }) => <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] break-words last:mb-0">{children}</h4>,
-                      p: ({ children }) => <p className="mb-1 break-words last:mb-0">{children}</p>,
-                      strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
-                      em: ({ children }) => <em className="italic">{children}</em>,
-                      ul: ({ children }) => <ul className="mb-1 ml-4 list-disc space-y-1 last:mb-0">{children}</ul>,
-                      ol: ({ children }) => <ol className="mb-1 ml-4 list-decimal space-y-1 last:mb-0">{children}</ol>,
-                      li: ({ children }) => <li className="break-words marker:text-current">{children}</li>,
-                      table: ({ children }) => (
-                        <div className="mb-1 overflow-x-auto rounded-lg border border-current/10 last:mb-0">
-                          <table className="min-w-full border-collapse text-left text-[11px] leading-relaxed">
-                            {children}
-                          </table>
-                        </div>
-                      ),
-                      thead: ({ children }) => <thead className="bg-black/8">{children}</thead>,
-                      tbody: ({ children }) => <tbody>{children}</tbody>,
-                      tr: ({ children }) => <tr className="border-b border-current/10 last:border-b-0">{children}</tr>,
-                      th: ({ children }) => <th className="px-2.5 py-1.5 font-semibold whitespace-nowrap">{children}</th>,
-                      td: ({ children }) => <td className="px-2.5 py-1.5 align-top break-words">{children}</td>,
-                      code: ({ children, className }) => {
-                        const text = getMarkdownText(children)
-                        const isBlock = Boolean(className) || text.includes("\n")
-                        if (isBlock) {
-                          return <code className="font-mono text-[11px] whitespace-pre-wrap break-words">{text.replace(/\n$/, "")}</code>
-                        }
-                        return <code className="rounded bg-black/10 px-1.5 py-0.5 font-mono text-[11px] break-all">{children}</code>
-                      },
-                      pre: ({ children }) => <pre className="mb-1 overflow-hidden rounded-lg bg-black/10 px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words last:mb-0">{children}</pre>,
-                      blockquote: ({ children }) => <blockquote className="mb-1 border-l-2 border-current/50 pl-3 opacity-85 last:mb-0">{children}</blockquote>,
-                      hr: () => <hr className="my-2 border-current/15" />,
-                      a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer" className="break-all underline underline-offset-2 opacity-85 hover:opacity-100">{children}</a>,
-                    }}
-                  >
-                    {message.content}
-                  </ReactMarkdown>
-                ) : (
-                  <span className="text-muted-foreground">Thinking...</span>
-                )}
-              </div>
-            </article>
-          ))
+                {message.parts.map((part, index) => (
+                  <AssistantPartView key={index} part={part} />
+                ))}
+                {isStreaming &&
+                isThinking &&
+                messageIndex === messages.length - 1 ? (
+                  <ThinkingIndicator />
+                ) : null}
+              </article>
+            ),
+          )
         )}
       </div>
 

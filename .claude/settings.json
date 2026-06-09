@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /d/vamshi/Node_Projects/claw && cat node_modules/@openai/agents/dist/index.d.ts | head -30; echo \"=== deps ===\"; ls node_modules/@openai/agents/node_modules/@openai 2>/dev/null; ls node_modules/.pnpm 2>/dev/null | grep -i agents-core | head)",
+      "Read(//d/d/vamshi/Node_Projects/claw/node_modules/@openai/agents/dist/**)"
+    ]
+  }
+}
