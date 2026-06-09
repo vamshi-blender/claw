@@ -34,6 +34,7 @@ export const DEFAULT_TEXT_VERBOSITY = parseTextVerbosity(
 export function createBrowserAgent(input: {
   sessionId: string
   runId: string
+  signal?: AbortSignal
   emitToolStatus?: (event: {
     toolCallId: string
     name: BrowserToolName
@@ -45,6 +46,7 @@ export function createBrowserAgent(input: {
     name: BROWSER_AGENT_NAME,
     model: DEFAULT_AGENT_MODEL,
     modelSettings: {
+      parallelToolCalls: true,
       reasoning: { effort: DEFAULT_REASONING_EFFORT },
       text: { verbosity: DEFAULT_TEXT_VERBOSITY },
     },

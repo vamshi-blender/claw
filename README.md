@@ -59,9 +59,10 @@ Extension source lives in `extension/src` and static manifest assets live in
 Build output is written to `extension/dist`. Load that folder in Chrome
 Developer Mode.
 
-The extension options page stores the backend URL in Chrome storage. The side
-panel uses that URL to create/resume a chat session and stream assistant
-responses from the backend.
+The extension options page stores the backend URL in Chrome storage. It offers a
+production option for `https://claw-mocha.vercel.app` and a development option
+that enables a custom backend URL field. The side panel uses the saved URL to
+create/resume a chat session and stream assistant responses from the backend.
 
 ## Storage
 

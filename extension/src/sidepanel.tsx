@@ -1,6 +1,6 @@
 import React from "react"
 import { createRoot } from "react-dom/client"
-import { Check, Copy, Plus } from "lucide-react"
+import { Check, Copy, Plus, Send, Square } from "lucide-react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 
@@ -255,6 +255,13 @@ function buildDebugTranscript(session: SessionDetail) {
     .join("\n")
 }
 
+function getMarkdownText(children: React.ReactNode) {
+  if (Array.isArray(children)) {
+    return children.map((child) => String(child)).join("")
+  }
+  return String(children ?? "")
+}
+
 function App() {
   const [backendUrl, setBackendUrl] = React.useState(DEFAULT_BACKEND_URL)
   const [sessionId, setSessionId] = React.useState<string>()
@@ -267,6 +274,7 @@ function App() {
   const [error, setError] = React.useState<string>()
   const [toolStatus, setToolStatus] = React.useState<string>()
   const messageListRef = React.useRef<HTMLDivElement>(null)
+  const messageAbortControllerRef = React.useRef<AbortController | null>(null)
 
   React.useEffect(() => {
     async function bootstrap() {
@@ -421,12 +429,19 @@ function App() {
   async function sendMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
 
-    const content = input.trim()
-    if (!content || !sessionId || isStreaming) {
+    if (isStreaming) {
+      messageAbortControllerRef.current?.abort()
       return
     }
 
+    const content = input.trim()
+    if (!content || !sessionId) {
+      return
+    }
+
+    const abortController = new AbortController()
     const assistantId = createLocalId("assistant")
+    messageAbortControllerRef.current = abortController
     setInput("")
     setError(undefined)
     setIsStreaming(true)
@@ -443,6 +458,7 @@ function App() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ message: content }),
+        signal: abortController.signal,
       })
 
       if (!response.ok || !response.body) {
@@ -485,6 +501,17 @@ function App() {
         }
       }
     } catch (sendError) {
+      if (abortController.signal.aborted) {
+        setMessages((current) =>
+          current.map((item) =>
+            item.id === assistantId && !item.content
+              ? { ...item, content: "Stopped." }
+              : item,
+          ),
+        )
+        return
+      }
+
       const message =
         sendError instanceof Error ? sendError.message : "Unable to send message."
       setError(message)
@@ -496,6 +523,9 @@ function App() {
         ),
       )
     } finally {
+      if (messageAbortControllerRef.current === abortController) {
+        messageAbortControllerRef.current = null
+      }
       setIsStreaming(false)
       setToolStatus(undefined)
     }
@@ -603,60 +633,52 @@ function App() {
               <div
                 className={
                   message.role === "user"
-                    ? "max-w-[86%] whitespace-pre-wrap rounded-lg bg-primary px-3 py-2 text-sm leading-6 text-primary-foreground"
+                    ? "max-w-[86%] rounded-lg bg-primary px-3 py-2 text-sm leading-6 text-primary-foreground"
                     : "max-w-[86%] rounded-lg border bg-card px-3 py-2 text-sm leading-6"
                 }
               >
                 {message.content ? (
-                  message.role === "user" ? (
-                    message.content
-                  ) : (
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                        strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
-                        em: ({ children }) => <em className="italic">{children}</em>,
-                        code: ({ children, className }) => {
-                          const isBlock = className?.includes("language-")
-                          return isBlock ? (
-                            <code className="block overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs">
-                              {children}
-                            </code>
-                          ) : (
-                            <code className="rounded bg-muted px-1 font-mono text-xs">{children}</code>
-                          )
-                        },
-                        pre: ({ children }) => <pre className="mb-2 overflow-x-auto rounded bg-muted p-2">{children}</pre>,
-                        ul: ({ children }) => <ul className="mb-2 list-disc pl-4">{children}</ul>,
-                        ol: ({ children }) => <ol className="mb-2 list-decimal pl-4">{children}</ol>,
-                        li: ({ children }) => <li className="mb-0.5">{children}</li>,
-                        h1: ({ children }) => <h1 className="mb-1 text-base font-bold">{children}</h1>,
-                        h2: ({ children }) => <h2 className="mb-1 text-sm font-bold">{children}</h2>,
-                        h3: ({ children }) => <h3 className="mb-1 text-sm font-semibold">{children}</h3>,
-                        a: ({ href, children }) => (
-                          <a href={href} target="_blank" rel="noreferrer" className="underline">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      h1: ({ children }) => <h1 className="mb-2 text-base font-bold leading-tight break-words last:mb-0">{children}</h1>,
+                      h2: ({ children }) => <h2 className="mb-2 text-sm font-semibold leading-tight break-words last:mb-0">{children}</h2>,
+                      h3: ({ children }) => <h3 className="mb-1.5 text-[13px] font-semibold leading-snug break-words last:mb-0">{children}</h3>,
+                      h4: ({ children }) => <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] break-words last:mb-0">{children}</h4>,
+                      p: ({ children }) => <p className="mb-1 break-words last:mb-0">{children}</p>,
+                      strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                      em: ({ children }) => <em className="italic">{children}</em>,
+                      ul: ({ children }) => <ul className="mb-1 ml-4 list-disc space-y-1 last:mb-0">{children}</ul>,
+                      ol: ({ children }) => <ol className="mb-1 ml-4 list-decimal space-y-1 last:mb-0">{children}</ol>,
+                      li: ({ children }) => <li className="break-words marker:text-current">{children}</li>,
+                      table: ({ children }) => (
+                        <div className="mb-1 overflow-x-auto rounded-lg border border-current/10 last:mb-0">
+                          <table className="min-w-full border-collapse text-left text-[11px] leading-relaxed">
                             {children}
-                          </a>
-                        ),
-                        blockquote: ({ children }) => (
-                          <blockquote className="mb-2 border-l-2 border-muted-foreground pl-2 text-muted-foreground">
-                            {children}
-                          </blockquote>
-                        ),
-                        hr: () => <hr className="my-2 border-border" />,
-                        table: ({ children }) => (
-                          <div className="mb-2 overflow-x-auto">
-                            <table className="w-full border-collapse text-xs">{children}</table>
-                          </div>
-                        ),
-                        th: ({ children }) => <th className="border border-border px-2 py-1 text-left font-semibold">{children}</th>,
-                        td: ({ children }) => <td className="border border-border px-2 py-1">{children}</td>,
-                      }}
-                    >
-                      {message.content}
-                    </ReactMarkdown>
-                  )
+                          </table>
+                        </div>
+                      ),
+                      thead: ({ children }) => <thead className="bg-black/8">{children}</thead>,
+                      tbody: ({ children }) => <tbody>{children}</tbody>,
+                      tr: ({ children }) => <tr className="border-b border-current/10 last:border-b-0">{children}</tr>,
+                      th: ({ children }) => <th className="px-2.5 py-1.5 font-semibold whitespace-nowrap">{children}</th>,
+                      td: ({ children }) => <td className="px-2.5 py-1.5 align-top break-words">{children}</td>,
+                      code: ({ children, className }) => {
+                        const text = getMarkdownText(children)
+                        const isBlock = Boolean(className) || text.includes("\n")
+                        if (isBlock) {
+                          return <code className="font-mono text-[11px] whitespace-pre-wrap break-words">{text.replace(/\n$/, "")}</code>
+                        }
+                        return <code className="rounded bg-black/10 px-1.5 py-0.5 font-mono text-[11px] break-all">{children}</code>
+                      },
+                      pre: ({ children }) => <pre className="mb-1 overflow-hidden rounded-lg bg-black/10 px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words last:mb-0">{children}</pre>,
+                      blockquote: ({ children }) => <blockquote className="mb-1 border-l-2 border-current/50 pl-3 opacity-85 last:mb-0">{children}</blockquote>,
+                      hr: () => <hr className="my-2 border-current/15" />,
+                      a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer" className="break-all underline underline-offset-2 opacity-85 hover:opacity-100">{children}</a>,
+                    }}
+                  >
+                    {message.content}
+                  </ReactMarkdown>
                 ) : (
                   <span className="text-muted-foreground">Thinking...</span>
                 )}
@@ -683,9 +705,12 @@ function App() {
         <Button
           className="self-end"
           type="submit"
-          disabled={isInitializing || isStreaming || !input.trim() || !sessionId}
+          size="icon"
+          title={isStreaming ? "Stop response" : "Send message"}
+          aria-label={isStreaming ? "Stop response" : "Send message"}
+          disabled={isInitializing || !sessionId || (!isStreaming && !input.trim())}
         >
-          {isStreaming ? "Sending" : "Send"}
+          {isStreaming ? <Square data-icon="inline-start" /> : <Send data-icon="inline-start" />}
         </Button>
       </form>
     </main>

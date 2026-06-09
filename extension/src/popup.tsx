@@ -3,15 +3,28 @@ import { createRoot } from "react-dom/client"
 
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import {
+  Field,
+  FieldContent,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+  FieldLegend,
+  FieldSet,
+  FieldTitle,
+} from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 
 import { ExtensionThemeProvider } from "./extension-theme-provider"
 import "./popup.css"
 
-const DEFAULT_BACKEND_URL = "http://localhost:3000"
+const PRODUCTION_BACKEND_URL = "https://claw-mocha.vercel.app"
+const DEFAULT_DEV_BACKEND_URL = "http://localhost:3000"
+const DEFAULT_BACKEND_URL = PRODUCTION_BACKEND_URL
 
 type StatusTone = "neutral" | "success" | "error"
+type BackendMode = "production" | "dev"
 
 function normalizeBackendUrl(value: string) {
   const url = new URL(value.trim())
@@ -39,7 +52,13 @@ async function saveBackendUrl(value: string) {
 }
 
 function App() {
-  const [backendUrl, setBackendUrl] = React.useState(DEFAULT_BACKEND_URL)
+  const [savedBackendUrl, setSavedBackendUrl] =
+    React.useState(DEFAULT_BACKEND_URL)
+  const [backendMode, setBackendMode] =
+    React.useState<BackendMode>("production")
+  const [devBackendUrl, setDevBackendUrl] = React.useState(
+    DEFAULT_DEV_BACKEND_URL
+  )
   const [status, setStatus] = React.useState<{
     message: string
     tone: StatusTone
@@ -50,15 +69,32 @@ function App() {
   const [isTesting, setIsTesting] = React.useState(false)
 
   React.useEffect(() => {
-    void getBackendUrl().then(setBackendUrl)
+    void getBackendUrl().then((storedBackendUrl) => {
+      setSavedBackendUrl(storedBackendUrl)
+
+      if (storedBackendUrl === PRODUCTION_BACKEND_URL) {
+        setBackendMode("production")
+        return
+      }
+
+      setBackendMode("dev")
+      setDevBackendUrl(storedBackendUrl)
+    })
   }, [])
+
+  const selectedBackendUrl =
+    backendMode === "production" ? PRODUCTION_BACKEND_URL : devBackendUrl
+  const hasChanges = selectedBackendUrl !== savedBackendUrl
 
   async function handleSave(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
 
     try {
-      const savedUrl = await saveBackendUrl(backendUrl)
-      setBackendUrl(savedUrl)
+      const savedUrl = await saveBackendUrl(selectedBackendUrl)
+      setSavedBackendUrl(savedUrl)
+      if (backendMode === "dev") {
+        setDevBackendUrl(savedUrl)
+      }
       setStatus({ message: "Backend URL saved.", tone: "success" })
     } catch (error) {
       setStatus({
@@ -73,10 +109,9 @@ function App() {
     setStatus({ message: "Testing connection...", tone: "neutral" })
 
     try {
-      const savedUrl = await saveBackendUrl(backendUrl)
-      setBackendUrl(savedUrl)
+      const backendUrl = normalizeBackendUrl(selectedBackendUrl)
 
-      const response = await fetch(`${savedUrl}/api/health`)
+      const response = await fetch(`${backendUrl}/api/health`)
       if (!response.ok) {
         throw new Error(`Health check failed with ${response.status}.`)
       }
@@ -112,20 +147,60 @@ function App() {
       </div>
 
       <form className="flex flex-col gap-3" onSubmit={handleSave}>
-        <div className="grid gap-2">
-          <Label htmlFor="backend-url">Backend URL</Label>
-          <Input
-            id="backend-url"
-            name="backendUrl"
-            value={backendUrl}
-            placeholder="http://localhost:3000"
-            autoComplete="off"
-            onChange={(event) => setBackendUrl(event.target.value)}
-          />
-        </div>
+        <FieldGroup>
+          <FieldSet>
+            <FieldLegend>Backend URL</FieldLegend>
+            <RadioGroup
+              value={backendMode}
+              onValueChange={(value) => setBackendMode(value as BackendMode)}
+            >
+              <FieldLabel htmlFor="backend-production">
+                <Field orientation="horizontal">
+                  <RadioGroupItem
+                    id="backend-production"
+                    value="production"
+                  />
+                  <FieldContent>
+                    <FieldTitle>Production</FieldTitle>
+                    <FieldDescription>
+                      {PRODUCTION_BACKEND_URL}
+                    </FieldDescription>
+                  </FieldContent>
+                </Field>
+              </FieldLabel>
+
+              <FieldLabel htmlFor="backend-dev">
+                <Field orientation="horizontal">
+                  <RadioGroupItem id="backend-dev" value="dev" />
+                  <FieldContent>
+                    <FieldTitle>Development</FieldTitle>
+                    <FieldDescription>
+                      Use a local or preview URL.
+                    </FieldDescription>
+                  </FieldContent>
+                </Field>
+              </FieldLabel>
+            </RadioGroup>
+          </FieldSet>
+
+          <Field data-disabled={backendMode !== "dev"}>
+            <FieldLabel htmlFor="dev-backend-url">Development URL</FieldLabel>
+            <Input
+              id="dev-backend-url"
+              name="devBackendUrl"
+              value={devBackendUrl}
+              placeholder={DEFAULT_DEV_BACKEND_URL}
+              autoComplete="off"
+              disabled={backendMode !== "dev"}
+              onChange={(event) => setDevBackendUrl(event.target.value)}
+            />
+          </Field>
+        </FieldGroup>
 
         <div className="grid grid-cols-2 gap-2">
-          <Button type="submit">Save</Button>
+          <Button type="submit" disabled={!hasChanges}>
+            Save
+          </Button>
           <Button
             type="button"
             variant="outline"

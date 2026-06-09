@@ -389,21 +389,81 @@ export const chatStore = {
     })
   },
 
-  waitForToolResult(toolCallId: string, timeoutMs = 60000) {
+  waitForToolResult(
+    toolCallId: string,
+    timeoutMs = 60000,
+    signal?: AbortSignal,
+  ) {
     const state = getState()
 
     return new Promise<ToolResultPayload>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new Error(`Tool request ${toolCallId} was cancelled.`))
+        return
+      }
+
+      function cleanup() {
+        clearTimeout(timeout)
+        signal?.removeEventListener("abort", handleAbort)
+        state.toolResultWaiters.delete(toolCallId)
+      }
+
+      function handleAbort() {
+        cleanup()
+        reject(new Error(`Tool request ${toolCallId} was cancelled.`))
+      }
+
       const timeout = setTimeout(() => {
+        signal?.removeEventListener("abort", handleAbort)
         state.toolResultWaiters.delete(toolCallId)
         reject(new Error(`Tool request ${toolCallId} timed out waiting for the extension.`))
       }, timeoutMs)
 
       state.toolResultWaiters.set(toolCallId, {
-        resolve,
-        reject,
+        resolve: (result) => {
+          cleanup()
+          resolve(result)
+        },
+        reject: (error) => {
+          cleanup()
+          reject(error)
+        },
         timeout,
       })
+
+      signal?.addEventListener("abort", handleAbort, { once: true })
     })
+  },
+
+  cancelRunToolRequests(sessionId: string, runId: string, reason: string) {
+    const state = getState()
+    const pending = state.pendingToolRequests.get(sessionId) ?? []
+    state.pendingToolRequests.set(
+      sessionId,
+      pending.filter((request) => request.runId !== runId),
+    )
+
+    const timestamp = now()
+    const toolCalls = state.toolCalls.get(sessionId) ?? []
+    for (const toolCall of toolCalls) {
+      if (
+        toolCall.runId !== runId ||
+        (toolCall.status !== "queued" && toolCall.status !== "running")
+      ) {
+        continue
+      }
+
+      const waiter = state.toolResultWaiters.get(toolCall.id)
+      if (waiter) {
+        waiter.reject(new Error(reason))
+      }
+
+      Object.assign(toolCall, {
+        status: "failed" satisfies ToolCallStatus,
+        completedAt: timestamp,
+        error: reason,
+      })
+    }
   },
 
   completeToolRequest(
@@ -414,9 +474,14 @@ export const chatStore = {
     const state = getState()
     const waiter = state.toolResultWaiters.get(toolCallId)
     if (waiter) {
-      clearTimeout(waiter.timeout)
-      state.toolResultWaiters.delete(toolCallId)
       waiter.resolve(result)
+    }
+
+    const toolCalls = state.toolCalls.get(sessionId)
+    const toolCall = toolCalls?.find((item) => item.id === toolCallId)
+    if (!waiter && toolCall?.completedAt) {
+      this.touchExtension(sessionId)
+      return
     }
 
     this.updateToolCall(sessionId, toolCallId, {

@@ -37,6 +37,10 @@ function encodeStreamEvent(type: string, payload: Record<string, unknown>) {
   return `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`
 }
 
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === "AbortError"
+}
+
 export async function POST(request: Request, context: RouteContext) {
   if (!process.env.OPENAI_API_KEY) {
     return streamError("OPENAI_API_KEY is not configured.", 500)
@@ -68,15 +72,31 @@ export async function POST(request: Request, context: RouteContext) {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let assistantText = ""
+      const stopReason = "Agent run was stopped."
+      const cancelRunToolRequests = () => {
+        chatStore.cancelRunToolRequests(sessionId, runRecord.id, stopReason)
+      }
+      request.signal.addEventListener("abort", cancelRunToolRequests, {
+        once: true,
+      })
 
       function sendEvent(type: string, payload: Record<string, unknown>) {
-        controller.enqueue(encoder.encode(encodeStreamEvent(type, payload)))
+        if (request.signal.aborted) {
+          return
+        }
+
+        try {
+          controller.enqueue(encoder.encode(encodeStreamEvent(type, payload)))
+        } catch {
+          // The browser may have already closed the stream after the user clicked Stop.
+        }
       }
 
       try {
         const agent = createBrowserAgent({
           sessionId,
           runId: runRecord.id,
+          signal: request.signal,
           emitToolStatus: (event) => {
             sendEvent("tool_status", event)
           },
@@ -85,9 +105,10 @@ export async function POST(request: Request, context: RouteContext) {
         const agentStream = await run(agent, userMessage, {
           stream: true,
           session: sdkSession,
-          maxTurns: 12,
+          maxTurns: 50,
+          signal: request.signal,
           toolExecution: {
-            maxFunctionToolConcurrency: 1,
+            maxFunctionToolConcurrency: 3,
           },
           toolNotFoundBehavior: "return_error_to_model",
         })
@@ -132,14 +153,36 @@ export async function POST(request: Request, context: RouteContext) {
         })
         chatStore.setSessionStatus(sessionId, "idle")
       } catch (error) {
+        if (request.signal.aborted || isAbortError(error)) {
+          cancelRunToolRequests()
+          if (assistantText) {
+            chatStore.addMessage({
+              sessionId,
+              role: "assistant",
+              content: assistantText,
+            })
+          }
+          chatStore.updateRun(sessionId, runRecord.id, {
+            status: "completed",
+            completedAt: new Date().toISOString(),
+          })
+          chatStore.setSessionStatus(sessionId, "idle")
+          return
+        }
+
         const message =
           error instanceof Error ? error.message : "Agent run failed unexpectedly."
 
         chatStore.completeRun(sessionId, runRecord.id, "failed", message)
         sendEvent("error", { message })
       } finally {
+        request.signal.removeEventListener("abort", cancelRunToolRequests)
         sendEvent("done", {})
-        controller.close()
+        try {
+          controller.close()
+        } catch {
+          // The stream can already be closed when the client aborts the request.
+        }
       }
     },
   })

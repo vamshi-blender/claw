@@ -14,6 +14,7 @@ type ToolStatusEmitter = (event: {
 type BrowserToolContext = {
   sessionId: string
   runId: string
+  signal?: AbortSignal
   emitStatus?: ToolStatusEmitter
 }
 
@@ -38,6 +39,10 @@ async function runExtensionTool(
   args: unknown,
   timeoutMs = 60000,
 ) {
+  if (context.signal?.aborted) {
+    return safeJson({ ok: false, error: "Tool request was cancelled." })
+  }
+
   const session = chatStore.getSession(context.sessionId)
   if (!session?.extension) {
     const message =
@@ -60,7 +65,11 @@ async function runExtensionTool(
   })
 
   try {
-    const result = await chatStore.waitForToolResult(request.id, timeoutMs)
+    const result = await chatStore.waitForToolResult(
+      request.id,
+      timeoutMs,
+      context.signal,
+    )
     context.emitStatus?.({
       toolCallId: request.id,
       name,
